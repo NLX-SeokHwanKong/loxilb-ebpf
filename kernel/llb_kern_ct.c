@@ -1853,6 +1853,21 @@ dp_ct_in(void *ctx, struct xfi *xf)
     axdat->ctd.pb.bytes = 0;
     axdat->ctd.pb.packets = 0;
 
+    if (xf->nm.dsr && key.l4proto == IPPROTO_TCP &&
+        !(xf->pm.tcp_flags & LLB_TCP_SYN)) {
+      /* A DSR entry created from a non-SYN segment is either an in-flight
+       * pick-up or a data retransmit that arrived after the entry was
+       * released at the client's FIN. In the second case nothing will ever
+       * close it, since the LB does not see the server's side, so give it
+       * an idle timeout instead of the 30 min EST timeout. A live
+       * connection re-creates its pair with its next data segment.
+       */
+      if (adat->ito == 0 || adat->ito > CT_DSR_NOSYN_CPTO) {
+        adat->ito = CT_DSR_NOSYN_CPTO;
+        axdat->ito = CT_DSR_NOSYN_CPTO;
+      }
+    }
+
     axtdat = bpf_map_lookup_elem(&ct_map, &xkey);
     if (axtdat != NULL) {
       dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, LLB_CT_FAIL_XKEY_EXIST);
