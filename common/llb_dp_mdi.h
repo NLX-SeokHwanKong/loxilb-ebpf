@@ -299,7 +299,9 @@ struct dp_nat_mdi {
     __u32            nxip[4];      /* NAT xIP */
     __u32            nrip[4];      /* NAT rIP (for one-arm) */
     __u32            pmhh[4];      /* Proxy for multi-homed hosts */
-    __u64            npmhh;        /* No. of proxy multi-homed hosts */
+    __u32            npmhh;        /* No. of proxy multi-homed hosts */
+    __u16            nrport;       /* See nat_rport in mf_xfrm_inf */
+    __u16            pad;          /* xfis is pinned: this struct keeps its size */
     __u16            nxport;       /* NAT xport */
 #define LLB_PIPE_CT_NONE  0
 #define LLB_PIPE_CT_INP   1

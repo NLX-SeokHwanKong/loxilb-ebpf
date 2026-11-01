@@ -454,6 +454,21 @@ struct ct_fail_stats_map_d {
         __uint(max_entries, LLB_CT_FAIL_MAX);
 } ct_fail_stats_map SEC(".maps");
 
+struct ct_xlate_stats_map_d {
+        __uint(type,        BPF_MAP_TYPE_PERCPU_ARRAY);
+        __type(key,         __u32);
+        __type(value,       struct dp_pb_stats);
+        __uint(max_entries, LLB_CT_XLATE_MAX);
+} ct_xlate_stats_map SEC(".maps");
+
+/* Recently closed SNAT tuples, in reverse key form. Value: bpf_ktime_get_ns */
+struct ct_closed_map_d {
+        __uint(type,        BPF_MAP_TYPE_LRU_HASH);
+        __type(key,         struct dp_ct_key);
+        __type(value,       __u64);
+        __uint(max_entries, CT_CLOSED_MAP_ENTRIES);
+} ct_closed_map SEC(".maps");
+
 struct nat_map_d {
         __uint(type,        BPF_MAP_TYPE_HASH);
         __type(key,         struct dp_nat_key);
@@ -643,6 +658,9 @@ dp_do_map_stats(void *ctx,
     break;
   case LL_DP_CT_FAIL_STATS_MAP:
     map = &ct_fail_stats_map;
+    break;
+  case LL_DP_CT_XLATE_STATS_MAP:
+    map = &ct_xlate_stats_map;
     break;
   case LL_DP_INTF_STATS_MAP:
     map = &intf_stats_map;
@@ -1851,6 +1869,21 @@ dp_set_icmp_src_ip(void *md, struct xfi *xf, __be32 xip)
 }
 
 static int __always_inline
+dp_set_icmp_echo_id(void *md, struct xfi *xf, __be16 id)
+{
+  int icmp_csum_off = xf->pm.l4_off + offsetof(struct icmphdr, checksum);
+  int icmp_id_off = xf->pm.l4_off + offsetof(struct icmphdr, un.echo.id);
+  __be32 old_id = xf->l34m.source;
+
+  if (xf->l34m.frg || !id) return 0;
+
+  bpf_l4_csum_replace(md, icmp_csum_off, old_id, id, sizeof(id));
+  bpf_skb_store_bytes(md, icmp_id_off, &id, sizeof(id), 0);
+
+  return 0;
+}
+
+static int __always_inline
 dp_set_icmp_dst_ip6(void *md, struct xfi *xf, __be32 *xip)
 {
   int icmp6_csum_off = xf->pm.l4_off + offsetof(struct icmp6hdr, icmp6_cksum);
@@ -2012,6 +2045,7 @@ dp_do_dnat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       dp_set_tcp_dst_ip(ctx, xf, xip);
     }
     dp_set_tcp_dport(ctx, xf, xport);
+    dp_set_tcp_sport(ctx, xf, xf->nm.nrport);
   } else if (xf->l34m.nw_proto == IPPROTO_UDP)  {
     struct udphdr *udp = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l4_off);
 
@@ -2032,6 +2066,7 @@ dp_do_dnat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       dp_set_udp_dst_ip(ctx, xf, xip);
     }
     dp_set_udp_dport(ctx, xf, xport);
+    dp_set_udp_sport(ctx, xf, xf->nm.nrport);
   } else if (xf->l34m.nw_proto == IPPROTO_SCTP)  {
     struct sctphdr *sctp = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l4_off);
 
@@ -2052,6 +2087,7 @@ dp_do_dnat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       dp_set_sctp_dst_ip(ctx, xf, xip);
     }
     dp_set_sctp_dport(ctx, xf, xport);
+    dp_set_sctp_sport(ctx, xf, xf->nm.nrport);
 #ifdef HAVE_DP_SCTP_SUM
     if (!xf->nm.cdis) {
       dp_csum_tcall(ctx, xf);
@@ -2064,6 +2100,7 @@ dp_do_dnat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       dp_set_icmp_src_ip(ctx, xf, xf->nm.nrip4);
     }
     dp_set_icmp_dst_ip(ctx, xf, xip);
+    dp_set_icmp_echo_id(ctx, xf, xf->nm.nrport);
   }
 
   return 0;
@@ -2093,6 +2130,7 @@ dp_do_dnat6(void *ctx, struct xfi *xf, __be32 *xip, __be16 xport)
       dp_set_tcp_dst_ip6(ctx, xf, xip);
     }
     dp_set_tcp_dport(ctx, xf, xport);
+    dp_set_tcp_sport(ctx, xf, xf->nm.nrport);
   } else if (xf->l34m.nw_proto == IPPROTO_UDP)  {
     struct udphdr *udp = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l4_off);
 
@@ -2113,6 +2151,7 @@ dp_do_dnat6(void *ctx, struct xfi *xf, __be32 *xip, __be16 xport)
       dp_set_udp_dst_ip6(ctx, xf, xip);
     }
     dp_set_udp_dport(ctx, xf, xport);
+    dp_set_udp_sport(ctx, xf, xf->nm.nrport);
   } else if (xf->l34m.nw_proto == IPPROTO_SCTP)  {
     struct sctphdr *sctp = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l4_off);
 
@@ -2133,6 +2172,7 @@ dp_do_dnat6(void *ctx, struct xfi *xf, __be32 *xip, __be16 xport)
       dp_set_sctp_dst_ip6(ctx, xf, xip);
     }
     dp_set_sctp_dport(ctx, xf, xport);
+    dp_set_sctp_sport(ctx, xf, xf->nm.nrport);
 #ifdef HAVE_DP_SCTP_SUM
     if (!xf->nm.cdis) {
       dp_csum_tcall(ctx, xf);
@@ -2174,6 +2214,9 @@ dp_do_snat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       }
     }
     dp_set_tcp_sport(ctx, xf, xport);
+    if (xf->nm.nrport) {
+      dp_set_tcp_dport(ctx, xf, xf->nm.nrport);
+    }
   } else if (xf->l34m.nw_proto == IPPROTO_UDP)  {
     struct udphdr *udp = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l4_off);
 
@@ -2194,6 +2237,9 @@ dp_do_snat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       }
     }
     dp_set_udp_sport(ctx, xf, xport);
+    if (xf->nm.nrport) {
+      dp_set_udp_dport(ctx, xf, xf->nm.nrport);
+    }
   } else if (xf->l34m.nw_proto == IPPROTO_SCTP)  {
     struct sctphdr *sctp = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l4_off);
 
@@ -2214,6 +2260,9 @@ dp_do_snat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       }
     }
     dp_set_sctp_sport(ctx, xf, xport);
+    if (xf->nm.nrport) {
+      dp_set_sctp_dport(ctx, xf, xf->nm.nrport);
+    }
 #ifdef HAVE_DP_SCTP_SUM
     if (!xf->nm.cdis) {
       dp_csum_tcall(ctx, xf);
@@ -2226,6 +2275,7 @@ dp_do_snat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
     if (xf->nm.nrip4) {
       dp_set_icmp_dst_ip(ctx, xf, xf->nm.nrip4);
     }
+    dp_set_icmp_echo_id(ctx, xf, xf->nm.nrport);
   }
 
   return 0;
@@ -2255,6 +2305,9 @@ dp_do_snat6(void *ctx, struct xfi *xf, __be32 *xip, __be16 xport)
       }
     }
     dp_set_tcp_sport(ctx, xf, xport);
+    if (xf->nm.nrport) {
+      dp_set_tcp_dport(ctx, xf, xf->nm.nrport);
+    }
   } else if (xf->l34m.nw_proto == IPPROTO_UDP)  {
     struct udphdr *udp = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l4_off);
 
@@ -2275,6 +2328,9 @@ dp_do_snat6(void *ctx, struct xfi *xf, __be32 *xip, __be16 xport)
       }
     }
     dp_set_udp_sport(ctx, xf, xport);
+    if (xf->nm.nrport) {
+      dp_set_udp_dport(ctx, xf, xf->nm.nrport);
+    }
   } else if (xf->l34m.nw_proto == IPPROTO_SCTP)  {
     struct sctphdr *sctp = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l4_off);
 
@@ -2295,6 +2351,9 @@ dp_do_snat6(void *ctx, struct xfi *xf, __be32 *xip, __be16 xport)
       }
     }
     dp_set_sctp_sport(ctx, xf, xport);
+    if (xf->nm.nrport) {
+      dp_set_sctp_dport(ctx, xf, xf->nm.nrport);
+    }
 #ifdef HAVE_DP_SCTP_SUM
     if (!xf->nm.cdis) {
       dp_csum_tcall(ctx, xf);
@@ -2513,6 +2572,7 @@ dp_do_dnat64(void *md, struct xfi *xf)
                         0, sum, BPF_F_PSEUDO_HDR);
 
     dp_set_tcp_dport(md, xf, xf->nm.nxport);
+    dp_set_tcp_sport(md, xf, xf->nm.nrport);
 
   } else {
 
@@ -2523,6 +2583,7 @@ dp_do_dnat64(void *md, struct xfi *xf)
     }
 
     dp_set_udp_dport(md, xf, xf->nm.nxport);
+    dp_set_udp_sport(md, xf, xf->nm.nrport);
   }
 
   /* Final packet structure validation - avoid pkt_end arithmetic */
@@ -2655,6 +2716,9 @@ dp_do_snat46(void *md, struct xfi *xf)
                       0, sum, BPF_F_PSEUDO_HDR);
 
     dp_set_tcp_sport(md, xf, xf->nm.nxport);
+    if (xf->nm.nrport) {
+      dp_set_tcp_dport(md, xf, xf->nm.nrport);
+    }
 
   } else {
 
@@ -2665,6 +2729,9 @@ dp_do_snat46(void *md, struct xfi *xf)
     }
 
     dp_set_udp_sport(md, xf, xf->nm.nxport);
+    if (xf->nm.nrport) {
+      dp_set_udp_dport(md, xf, xf->nm.nrport);
+    }
   }
 
   return 0;

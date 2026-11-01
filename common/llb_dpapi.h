@@ -88,6 +88,18 @@
  * 30 min EST timeout, since the LB never sees the server's close */
 #define CT_DSR_NOSYN_CPTO     (60000000000)
 
+/* How long a closed SNAT tuple is held back from reuse: Linux TIME_WAIT, 60 s,
+ * and a margin. A backend with a longer TIME_WAIT gets no worse than without
+ * this after the window. */
+#define CT_CLOSED_WINDOW_NS   (65000000000ULL)
+/* Holds the window up to about 2 K closes/s; beyond that the oldest are lost */
+#define CT_CLOSED_MAP_ENTRIES (128 * 1024)
+/* Picking another SNAT source port: random start, odd step, all within range */
+#define CT_XLATE_TRIES        8
+#define CT_XLATE_PORT_MIN     1024
+#define CT_XLATE_PORT_RANGE   64512
+#define CT_XLATE_PORT_STEP    4099
+
 /* FW Mark values */
 #define LLB_MARK_NAT          (0x80000000)
 #define LLB_MARK_SRC          (0x40000000)
@@ -155,6 +167,7 @@ enum llb_dp_tid {
   LL_DP_SOCK_RWR_MAP,
   LL_DP_SOCK_PROXY_MAP,
   LL_DP_CT_FAIL_STATS_MAP,
+  LL_DP_CT_XLATE_STATS_MAP,
   LL_DP_MAX_MAP
 };
 
@@ -167,6 +180,15 @@ enum llb_ct_fail {
   LLB_CT_FAIL_XKEY_EXIST,   /* reverse key present without the forward key */
   LLB_CT_FAIL_XKEY_MISS,    /* forward key present without the reverse key */
   LLB_CT_FAIL_MAX
+};
+
+/* Index into ct_xlate_stats_map: SNAT source port translation. A separate map,
+ * since pinned maps are reused across an upgrade and so keep their size.
+ */
+enum llb_ct_xlate {
+  LLB_CT_XLATE_DONE = 0,    /* flow got another source port */
+  LLB_CT_XLATE_EXHAUST,     /* in conflict, and no port could be used */
+  LLB_CT_XLATE_MAX
 };
 
 enum {
@@ -266,6 +288,8 @@ struct dp_nat_act {
   __u8 cdis;
   __u8 nmh;
   __u8 ppv2;
+  __u8 pad;
+  __u16 rport;  /* Peer-side port to rewrite, 0 for none: see nat_rport */
 };
 
 #define MIN_DP_POLICER_RATE  (8*1000*1000)  /* 1 MBps = 8 Mbps */
@@ -691,7 +715,11 @@ struct mf_xfrm_inf {
   uint16_t nat_xport;
   uint16_t osp;
   uint16_t odp;
-  uint8_t pad2[2];
+  /* A translated SNAT source port. Forward entry: the source port to write.
+   * Reverse entry: the client's port, the destination port to restore. 0, the
+   * case for a flow without a conflict: the source port is kept.
+   */
+  uint16_t nat_rport;
 };
 typedef struct mf_xfrm_inf nxfrm_inf_t;
 
