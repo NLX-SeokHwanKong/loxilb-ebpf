@@ -824,6 +824,7 @@ struct dp_nat_key {
 #define NAT_LB_SEL_LC 4
 #define NAT_LB_SEL_N2 5
 #define NAT_LB_SEL_N3 6
+#define NAT_LB_SEL_QUIC_CID 7
 
 #define NAT_LB_PERSIST_TIMEOUT (10800000000000ULL)
 
@@ -846,13 +847,22 @@ struct dp_proxy_tacts {
   uint8_t sel_type;
   uint8_t sec_mode;
   uint8_t ppv2;
-  uint8_t pad1[7];
+  uint8_t quic_sid_len;     /* NAT_LB_SEL_QUIC_CID only */
+  uint8_t quic_cr;          /* NAT_LB_SEL_QUIC_CID only */
+  uint8_t pad1[5];
   uint64_t lts;
   uint64_t base_to;
   uint32_t pmhh[LLB_MAX_MHOSTS];
   uint8_t pad2[4];
   struct mf_xfrm_inf nxfrms[LLB_MAX_NXFRMS];
   uint8_t host_url[LLB_MAX_HOSTURL_LEN];
+};
+
+/* Per-rule NAT_LB_SEL_QUIC_CID selector counters, indexed by the rule's cidx */
+struct dp_quic_cid_stats {
+  uint64_t routed;      /* Endpoint chosen by server ID */
+  uint64_t unroutable;  /* Not parsed or CR mismatch: hash fallback */
+  uint64_t miss;        /* No active endpoint has this server ID: hash fallback */
 };
 
 struct dp_nat_epacts {

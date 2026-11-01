@@ -4,6 +4,10 @@
  * 
  * SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
  */
+#ifdef HAVE_DP_QUIC_CID
+#include "llb_kern_quic_cid.h"
+#endif
+
 static void __always_inline
 dp_do_dec_nat_sess(void *ctx, struct xfi *xf, __u32 rule, __u16 aid)
 {
@@ -141,6 +145,10 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
       }
       bpf_spin_unlock(&epa->lock);
     }
+#ifdef HAVE_DP_QUIC_CID
+  } else if (act->sel_type == NAT_LB_SEL_QUIC_CID) {
+    sel = dp_sel_quic_cid(ctx, xf, act);
+#endif
   }
 
   BPF_TRACE_PRINTK("[NAT] lb-sel %d", sel);

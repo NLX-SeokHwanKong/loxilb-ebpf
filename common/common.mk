@@ -87,6 +87,11 @@ CFLAGS_ALL ?= -DHAVE_DP_FC=1 -DHAVE_DP_EXTCT=1 -DHAVE_DP_SCTP_SUM=1 -DHAVE_DP_CT
 ifeq ($(CLANG), clang-13)
 CFLAGS_ALL += -DHAVE_CLANG13
 endif
+# Set to 0 to build without the QUIC CID selector: the datapath is then identical to one without the feature
+QUIC_CID ?= 1
+ifeq ($(QUIC_CID), 1)
+CFLAGS_ALL += -DHAVE_DP_QUIC_CID=1
+endif
 CFLAGS ?= -I$(LIBBPF_DIR)/build/usr/include/ -g
 CFLAGS += -I../headers/ -I$(LIBBPF_DIR)/ $(CFLAGS_ALL)
 LDFLAGS ?= -L$(LIBBPF_DIR)
