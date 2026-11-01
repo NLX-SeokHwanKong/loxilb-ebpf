@@ -179,6 +179,10 @@ dp_ct_proto_xfk_init(struct dp_ct_key *key,
           xkey->sport = xi->nat_xport;
         else
           xi->nat_xport = key->dport;
+        if (xi->nat_rport) {
+          xkey->dport = xi->nat_rport;
+          xxi->nat_rport = key->sport;
+        }
     }
 
     xxi->nat_flags = LLB_NAT_SRC;
@@ -199,6 +203,10 @@ dp_ct_proto_xfk_init(struct dp_ct_key *key,
         xkey->dport = xi->nat_xport;
       else
         xi->nat_xport = key->sport;
+      if (xi->nat_rport) {
+        xkey->sport = xi->nat_rport;
+        xxi->nat_rport = key->dport;
+      }
     }
 
     xxi->nat_flags = LLB_NAT_DST;
@@ -1684,6 +1692,112 @@ dp_ct_ctd(struct xfi *xf,
   return 0;
 }
 
+/* Is this reverse key unusable: live in ct_map, or, for TCP, closed recently
+ * enough for the backend to hold the tuple in TIME_WAIT
+ */
+static int __always_inline
+dp_ct_xkey_taken(struct dp_ct_key *xkey, __u64 now)
+{
+  __u64 *ts;
+
+  if (bpf_map_lookup_elem(&ct_map, xkey) != NULL) {
+    return 1;
+  }
+
+  if (xkey->l4proto == IPPROTO_TCP) {
+    ts = bpf_map_lookup_elem(&ct_closed_map, xkey);
+    if (ts != NULL && now - *ts < CT_CLOSED_WINDOW_NS) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+/* SNAT keeps the client's source port, so two clients with the same port make
+ * the same tuple towards the backend. For a new flow whose tuple is taken, pick
+ * another port. If none can be used xkey is left as it was: a live tuple then
+ * takes the xkey_exist drop, a recently closed one goes on with the client's
+ * port. A port set by the user is never changed.
+ */
+static void __always_inline
+dp_ct_snat_pick_port(void *ctx, struct xfi *xf, struct dp_ct_key *key,
+                     struct dp_ct_key *xkey, nxfrm_inf_t *xi, nxfrm_inf_t *xxi)
+{
+  int snat = xi->nat_flags & LLB_NAT_SRC;
+  __u64 now;
+  __u32 base;
+  __be16 cport;
+  int i;
+
+  if (xi->dsr || (!snat && !(xi->nat_flags & LLB_NAT_DST)) ||
+      (!snat && DP_XADDR_ISZR(xi->nat_rip))) {
+    return;
+  }
+
+  if (key->l4proto != IPPROTO_TCP &&
+      key->l4proto != IPPROTO_UDP &&
+      key->l4proto != IPPROTO_SCTP) {
+    return;
+  }
+
+  now = bpf_ktime_get_ns();
+  if (!dp_ct_xkey_taken(xkey, now)) {
+    return;
+  }
+
+  if (!snat || !xf->nm.nxport) {
+    cport = xkey->dport;
+    base = bpf_get_prandom_u32();
+
+    for (i = 0; i < CT_XLATE_TRIES; i++) {
+      xkey->dport = bpf_htons(CT_XLATE_PORT_MIN +
+                              (base + i * CT_XLATE_PORT_STEP) % CT_XLATE_PORT_RANGE);
+      if (dp_ct_xkey_taken(xkey, now)) {
+        continue;
+      }
+
+      if (snat) {
+        /* The reverse entry already restores the client's port from key */
+        xi->nat_xport = xkey->dport;
+        xf->nm.nxport = xkey->dport;
+      } else {
+        xi->nat_rport = xkey->dport;
+        xxi->nat_rport = key->sport;
+        xf->nm.nrport = xkey->dport;
+      }
+      dp_do_map_stats(ctx, xf, LL_DP_CT_XLATE_STATS_MAP, LLB_CT_XLATE_DONE);
+      return;
+    }
+    xkey->dport = cport;
+  }
+
+  dp_do_map_stats(ctx, xf, LL_DP_CT_XLATE_STATS_MAP, LLB_CT_XLATE_EXHAUST);
+}
+
+/* A FIN or RST of an SNAT flow: the backend may soon hold this tuple in
+ * TIME_WAIT. Only the side closing first does, but which one it was is not
+ * known here; a needless translation later costs nothing.
+ */
+static void __always_inline
+dp_ct_note_closed(struct dp_ct_key *key, struct dp_ct_key *xkey,
+                  struct dp_ct_tact *atdat, struct dp_ct_tact *axtdat)
+{
+  int in = atdat->ctd.dir == CT_DIR_IN;
+  nxfrm_inf_t *fxi = in ? &atdat->ctd.xi : &axtdat->ctd.xi;
+  __u64 now;
+
+  if (fxi->dsr) {
+    return;
+  }
+
+  if ((fxi->nat_flags & LLB_NAT_SRC) ||
+      ((fxi->nat_flags & LLB_NAT_DST) && !DP_XADDR_ISZR(fxi->nat_rip))) {
+    now = bpf_ktime_get_ns();
+    bpf_map_update_elem(&ct_closed_map, in ? xkey : key, &now, BPF_ANY);
+  }
+}
+
 static int __always_inline
 dp_ct_in(void *ctx, struct xfi *xf)
 {
@@ -1735,11 +1849,13 @@ dp_ct_in(void *ctx, struct xfi *xf)
   DP_XADDR_CP(xi->nat_xip, xf->nm.nxip);
   DP_XADDR_CP(xi->nat_rip, xf->nm.nrip);
   xi->nat_xport = xf->nm.nxport;
+  xi->nat_rport = xf->nm.nrport;
   xi->nv6 = xf->nm.nv6;
   xi->dsr = xf->nm.dsr;
 
   xxi->nat_flags = 0;
   xxi->nat_xport = 0;
+  xxi->nat_rport = 0;
   DP_XADDR_SETZR(xxi->nat_xip);
   DP_XADDR_SETZR(xxi->nat_rip);
 
@@ -1776,7 +1892,11 @@ dp_ct_in(void *ctx, struct xfi *xf)
       }
     }
 
+    dp_ct_snat_pick_port(ctx, xf, &key, &xkey, xi, xxi);
+
     BPF_TRACE_PRINTK("[CTRK] new-ct ent");
+    adat->nat_act.rport = xi->nat_rport;
+    axdat->nat_act.rport = xxi->nat_rport;
     adat->ca.ftrap = 0;
     adat->ca.oaux = 0;
     adat->ca.cidx = dp_ct_get_newctr(&adat->ctd.nid);
@@ -1910,6 +2030,10 @@ dp_ct_in(void *ctx, struct xfi *xf)
   if (atdat != NULL && axtdat != NULL) {
     atdat->lts = bpf_ktime_get_ns();
     axtdat->lts = atdat->lts;
+    if (key.l4proto == IPPROTO_TCP &&
+        (xf->pm.tcp_flags & (LLB_TCP_FIN|LLB_TCP_RST))) {
+      dp_ct_note_closed(&key, &xkey, atdat, axtdat);
+    }
     if (atdat->ctd.dir == CT_DIR_IN) {
       xf->pm.dir = CT_DIR_IN;
       BPF_TRACE_PRINTK("[CTRK] ct in-dir");

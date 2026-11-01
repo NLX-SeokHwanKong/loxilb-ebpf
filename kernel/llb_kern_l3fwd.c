@@ -255,6 +255,7 @@ dp_pipe_set_nat(void *ctx, struct xfi *xf,
   DP_XADDR_CP(xf->nm.nxip, na->xip);
   DP_XADDR_CP(xf->nm.nrip, na->rip);
   xf->nm.nxport = na->xport;
+  xf->nm.nrport = na->rport;
   xf->nm.nv6 = na->nv6 ? 1 : 0;
   xf->nm.dsr = na->dsr;
   xf->nm.cdis = na->cdis;

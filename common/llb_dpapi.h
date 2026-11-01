@@ -94,6 +94,11 @@
 #define CT_CLOSED_WINDOW_NS   (65000000000ULL)
 /* Holds the window up to about 2 K closes/s; beyond that the oldest are lost */
 #define CT_CLOSED_MAP_ENTRIES (128 * 1024)
+/* Picking another SNAT source port: random start, odd step, all within range */
+#define CT_XLATE_TRIES        8
+#define CT_XLATE_PORT_MIN     1024
+#define CT_XLATE_PORT_RANGE   64512
+#define CT_XLATE_PORT_STEP    4099
 
 /* FW Mark values */
 #define LLB_MARK_NAT          (0x80000000)
@@ -283,6 +288,8 @@ struct dp_nat_act {
   __u8 cdis;
   __u8 nmh;
   __u8 ppv2;
+  __u8 pad;
+  __u16 rport;  /* Peer-side port to rewrite, 0 for none: see nat_rport */
 };
 
 #define MIN_DP_POLICER_RATE  (8*1000*1000)  /* 1 MBps = 8 Mbps */
@@ -708,7 +715,11 @@ struct mf_xfrm_inf {
   uint16_t nat_xport;
   uint16_t osp;
   uint16_t odp;
-  uint8_t pad2[2];
+  /* A translated SNAT source port. Forward entry: the source port to write.
+   * Reverse entry: the client's port, the destination port to restore. 0, the
+   * case for a flow without a conflict: the source port is kept.
+   */
+  uint16_t nat_rport;
 };
 typedef struct mf_xfrm_inf nxfrm_inf_t;
 

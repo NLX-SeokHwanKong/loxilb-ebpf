@@ -2774,6 +2774,8 @@ ctm_proto_xfk_init(struct dp_ct_key *key,
     if (key->l4proto != IPPROTO_ICMP) {
         if (xi->nat_xport)
           xkey->sport = xi->nat_xport;
+        if (xi->nat_rport)
+          xkey->dport = xi->nat_rport;
     }
   }
   if (xi->nat_flags & LLB_NAT_SRC) {
@@ -2785,6 +2787,8 @@ ctm_proto_xfk_init(struct dp_ct_key *key,
     if (key->l4proto != IPPROTO_ICMP) {
       if (xi->nat_xport)
         xkey->dport = xi->nat_xport;
+      if (xi->nat_rport)
+        xkey->sport = xi->nat_rport;
     }
   }
   if (xi->nat_flags & LLB_NAT_HDST) {
