@@ -11,6 +11,11 @@ static const char *ct_fail_names[LLB_CT_FAIL_MAX] = {
   "map-full", "half-insert", "xkey-exist", "xkey-miss"
 };
 
+/* ct_xlate_stats_map indices, see enum llb_ct_xlate */
+static const char *ct_xlate_names[LLB_CT_XLATE_MAX] = {
+  "translated", "exhausted"
+};
+
 static void
 print_usage(void)
 {
@@ -18,7 +23,7 @@ print_usage(void)
   printf("./pgm trace all\n");
   printf("./pgm trace excp\n");
   printf("./pgm trace disable\n");
-  printf("./pgm stats ctfail     (conntrack insert/lookup failures)\n");
+  printf("./pgm stats ctfail     (conntrack insert/lookup failures, SNAT port translation)\n");
   printf("\n\nPress CTRL-C to exit program\n");
   printf("********************************\n");
 }
@@ -39,6 +44,18 @@ print_ct_fail_stats(void)
       continue;
     }
     printf("%-12s %12llu %12llu\n", ct_fail_names[i],
+           (unsigned long long)pkts, (unsigned long long)bytes);
+  }
+  for (i = 0; i < LLB_CT_XLATE_MAX; i++) {
+    uint64_t bytes = 0;
+    uint64_t pkts = 0;
+
+    if (llb_fetch_map_stats_cached(LL_DP_CT_XLATE_STATS_MAP, i, 1,
+                                   &bytes, &pkts) != 0) {
+      printf("%-12s %12s\n", ct_xlate_names[i], "n/a");
+      continue;
+    }
+    printf("%-12s %12llu %12llu\n", ct_xlate_names[i],
            (unsigned long long)pkts, (unsigned long long)bytes);
   }
 }

@@ -1584,6 +1584,13 @@ llb_xh_init(llb_dp_struct_t *xh)
                                                  sizeof(struct dp_pbc_stats));
   assert(xh->maps[LL_DP_CT_FAIL_STATS_MAP].pbs);
 
+  xh->maps[LL_DP_CT_XLATE_STATS_MAP].map_name = "ct_xlate_stats_map";
+  xh->maps[LL_DP_CT_XLATE_STATS_MAP].has_pb   = 1;
+  xh->maps[LL_DP_CT_XLATE_STATS_MAP].max_entries = LLB_CT_XLATE_MAX;
+  xh->maps[LL_DP_CT_XLATE_STATS_MAP].pbs = calloc(LLB_CT_XLATE_MAX,
+                                                  sizeof(struct dp_pbc_stats));
+  assert(xh->maps[LL_DP_CT_XLATE_STATS_MAP].pbs);
+
   xh->maps[LL_DP_PPLAT_MAP].map_name = "pplat_map";
   xh->maps[LL_DP_PPLAT_MAP].has_pb   = 1;
   xh->maps[LL_DP_PPLAT_MAP].max_entries = LLB_PPLAT_MAP_ENTRIES;
