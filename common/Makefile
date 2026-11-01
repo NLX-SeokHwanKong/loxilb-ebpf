@@ -50,7 +50,13 @@ http.o: http.c
 llhttp.a: llhttp.o llhttpapi.o http.o
 	$(AR) rcs -c $@ $^
 
-.PHONY: clean
+test_llb_quic_cid: test_llb_quic_cid.c llb_quic_cid.h
+	$(CC) -g -Wall -Wextra -Werror -o $@ $<
+
+quic-cid-test: test_llb_quic_cid
+	./test_llb_quic_cid
+
+.PHONY: clean quic-cid-test
 
 clean:
-	rm -f *.o
+	rm -f *.o test_llb_quic_cid
