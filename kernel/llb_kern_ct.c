@@ -183,6 +183,11 @@ dp_ct_proto_xfk_init(struct dp_ct_key *key,
           xkey->dport = xi->nat_rport;
           xxi->nat_rport = key->sport;
         }
+    } else if (xi->nat_rport) {
+      /* An echo id is both ports of the key */
+      xkey->sport = xi->nat_rport;
+      xkey->dport = xi->nat_rport;
+      xxi->nat_rport = key->sport;
     }
 
     xxi->nat_flags = LLB_NAT_SRC;
@@ -207,6 +212,10 @@ dp_ct_proto_xfk_init(struct dp_ct_key *key,
         xkey->sport = xi->nat_rport;
         xxi->nat_rport = key->dport;
       }
+    } else if (xi->nat_rport) {
+      xkey->sport = xi->nat_rport;
+      xkey->dport = xi->nat_rport;
+      xxi->nat_rport = key->dport;
     }
 
     xxi->nat_flags = LLB_NAT_DST;
@@ -1737,7 +1746,8 @@ dp_ct_snat_pick_port(void *ctx, struct xfi *xf, struct dp_ct_key *key,
 
   if (key->l4proto != IPPROTO_TCP &&
       key->l4proto != IPPROTO_UDP &&
-      key->l4proto != IPPROTO_SCTP) {
+      key->l4proto != IPPROTO_SCTP &&
+      !(key->l4proto == IPPROTO_ICMP && key->sport)) {
     return;
   }
 
@@ -1753,11 +1763,14 @@ dp_ct_snat_pick_port(void *ctx, struct xfi *xf, struct dp_ct_key *key,
     for (i = 0; i < CT_XLATE_TRIES; i++) {
       xkey->dport = bpf_htons(CT_XLATE_PORT_MIN +
                               (base + i * CT_XLATE_PORT_STEP) % CT_XLATE_PORT_RANGE);
+      if (key->l4proto == IPPROTO_ICMP) {
+        xkey->sport = xkey->dport;
+      }
       if (dp_ct_xkey_taken(xkey, now)) {
         continue;
       }
 
-      if (snat) {
+      if (snat && key->l4proto != IPPROTO_ICMP) {
         /* The reverse entry already restores the client's port from key */
         xi->nat_xport = xkey->dport;
         xf->nm.nxport = xkey->dport;
@@ -1770,6 +1783,9 @@ dp_ct_snat_pick_port(void *ctx, struct xfi *xf, struct dp_ct_key *key,
       return;
     }
     xkey->dport = cport;
+    if (key->l4proto == IPPROTO_ICMP) {
+      xkey->sport = cport;
+    }
   }
 
   dp_do_map_stats(ctx, xf, LL_DP_CT_XLATE_STATS_MAP, LLB_CT_XLATE_EXHAUST);

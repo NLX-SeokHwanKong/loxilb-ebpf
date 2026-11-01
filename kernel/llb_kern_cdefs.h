@@ -1869,6 +1869,21 @@ dp_set_icmp_src_ip(void *md, struct xfi *xf, __be32 xip)
 }
 
 static int __always_inline
+dp_set_icmp_echo_id(void *md, struct xfi *xf, __be16 id)
+{
+  int icmp_csum_off = xf->pm.l4_off + offsetof(struct icmphdr, checksum);
+  int icmp_id_off = xf->pm.l4_off + offsetof(struct icmphdr, un.echo.id);
+  __be32 old_id = xf->l34m.source;
+
+  if (xf->l34m.frg || !id) return 0;
+
+  bpf_l4_csum_replace(md, icmp_csum_off, old_id, id, sizeof(id));
+  bpf_skb_store_bytes(md, icmp_id_off, &id, sizeof(id), 0);
+
+  return 0;
+}
+
+static int __always_inline
 dp_set_icmp_dst_ip6(void *md, struct xfi *xf, __be32 *xip)
 {
   int icmp6_csum_off = xf->pm.l4_off + offsetof(struct icmp6hdr, icmp6_cksum);
@@ -2085,6 +2100,7 @@ dp_do_dnat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       dp_set_icmp_src_ip(ctx, xf, xf->nm.nrip4);
     }
     dp_set_icmp_dst_ip(ctx, xf, xip);
+    dp_set_icmp_echo_id(ctx, xf, xf->nm.nrport);
   }
 
   return 0;
@@ -2259,6 +2275,7 @@ dp_do_snat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
     if (xf->nm.nrip4) {
       dp_set_icmp_dst_ip(ctx, xf, xf->nm.nrip4);
     }
+    dp_set_icmp_echo_id(ctx, xf, xf->nm.nrport);
   }
 
   return 0;
