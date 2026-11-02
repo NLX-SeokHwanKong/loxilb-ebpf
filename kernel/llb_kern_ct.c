@@ -285,6 +285,9 @@ dp_ct3_sm(struct dp_ct_dat *tdat,
   return 0;
 }
 
+#define CT_TCP_FIN_SEEN  0x1
+#define CT_TCP_FIN_ACKED 0x2
+
 static int __always_inline
 dp_ct_tcp_sm(void *ctx, struct xfi *xf, 
              struct dp_ct_tact *atdat,
@@ -346,6 +349,58 @@ dp_ct_tcp_sm(void *ctx, struct xfi *xf,
 
   if (tcp_flags & LLB_TCP_RST) {
     nstate = CT_TCP_CW;
+    goto end;
+  }
+
+  /* NAT needs both FINs acknowledged before discarding the reverse transform.
+   * In a simultaneous close, FIN+ACK need not acknowledge the peer's FIN.
+   * hstate is per-direction close tracking; seq holds FIN's sequence-space end
+   * only after FIN_SEEN. Keep DSR's early release and non-NAT handling below.
+   */
+  if (tdat->xi.nat_flags && !tdat->xi.dsr &&
+      (ts->state == CT_TCP_EST || ts->state == CT_TCP_PEST ||
+       ts->state == CT_TCP_FINI || ts->state == CT_TCP_FINI2 ||
+       ts->state == CT_TCP_FINI3) &&
+      ((tcp_flags & LLB_TCP_FIN) || (ts->state & CT_TCP_FIN_MASK))) {
+    __u32 close_ack = ack;
+
+    if ((tcp_flags & LLB_TCP_FIN) && !(td->hstate & CT_TCP_FIN_SEEN)) {
+      __u32 thlen = (__u32)t->doff << 2;
+
+      if (thlen < sizeof(*t) || thlen > xf->pm.l3_plen) {
+        nstate = CT_TCP_ERR;
+        goto end;
+      }
+      if (!(ts->tcp_cts[0].hstate & CT_TCP_FIN_SEEN) &&
+          !(ts->tcp_cts[1].hstate & CT_TCP_FIN_SEEN)) {
+        ts->fndir = dir;
+      }
+      td->seq = seq + (xf->pm.l3_plen - thlen) + 1;
+      td->hstate |= CT_TCP_FIN_SEEN;
+    }
+
+#ifdef LL_TC_EBPF
+    /* Backend ACKs include the inserted PPv2 header; client SEQs do not. */
+    if (dir == CT_DIR_OUT && td->ppv2) {
+      close_ack -= sizeof(struct proxy_hdr_v2) +
+                   (dp_is_ppv2_ipv6(xf) ? sizeof(struct proxy_ipv6_hdr) :
+                                           sizeof(struct proxy_ipv4_hdr));
+    }
+#endif
+    if ((tcp_flags & LLB_TCP_ACK) && (rtd->hstate & CT_TCP_FIN_SEEN) &&
+        close_ack == rtd->seq) {
+      rtd->hstate |= CT_TCP_FIN_ACKED;
+    }
+
+    if ((td->hstate & CT_TCP_FIN_SEEN) &&
+        (rtd->hstate & CT_TCP_FIN_SEEN)) {
+      nstate = ((td->hstate & CT_TCP_FIN_ACKED) &&
+                (rtd->hstate & CT_TCP_FIN_ACKED)) ? CT_TCP_CW : CT_TCP_FINI3;
+    } else {
+      ct_tcp_pinfd_t *first = &ts->tcp_cts[ts->fndir == CT_DIR_IN ? 0 : 1];
+
+      nstate = (first->hstate & CT_TCP_FIN_ACKED) ? CT_TCP_FINI2 : CT_TCP_FINI;
+    }
     goto end;
   }
 
@@ -1685,6 +1740,28 @@ dp_ct_ctd(struct xfi *xf,
 }
 
 static int __always_inline
+dp_ct_tcp_terminal(struct dp_ct_tact *act)
+{
+  return act->ctd.xi.nat_flags && !act->ctd.xi.dsr &&
+         act->ctd.pi.t.state == CT_TCP_CW;
+}
+
+static int __always_inline
+dp_ct_release_terminal(struct dp_ct_tact *forward, struct dp_ct_tact *reverse)
+{
+  int release = 0;
+
+  bpf_spin_lock(&forward->lock);
+  if (forward->ctd.smr != CT_SMR_CTD) {
+    forward->ctd.smr = CT_SMR_CTD;
+    reverse->ctd.smr = CT_SMR_CTD;
+    release = 1;
+  }
+  bpf_spin_unlock(&forward->lock);
+  return release;
+}
+
+static int __always_inline
 dp_ct_in(void *ctx, struct xfi *xf)
 {
   struct dp_ct_key key;
@@ -1739,6 +1816,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
   xi->dsr = xf->nm.dsr;
 
   xxi->nat_flags = 0;
+  xxi->dsr = 0;
   xxi->nat_xport = 0;
   DP_XADDR_SETZR(xxi->nat_xip);
   DP_XADDR_SETZR(xxi->nat_rip);
@@ -1904,6 +1982,16 @@ dp_ct_in(void *ctx, struct xfi *xf)
   }
 
   if (atdat != NULL && axtdat != NULL) {
+    /* Keep only the transform during the existing FIN cleanup interval.
+     * Retransmissions must not move the terminal pair's cleanup deadline.
+     */
+    if (key.l4proto == IPPROTO_TCP && dp_ct_tcp_terminal(atdat)) {
+      /* Preserve per-direction PPv2 sequence fixup on late segments too. */
+      if (atdat->ctd.dir == CT_DIR_IN) {
+        return dp_ct_tcp_sm(ctx, xf, atdat, axtdat, CT_DIR_IN);
+      }
+      return dp_ct_tcp_sm(ctx, xf, axtdat, atdat, CT_DIR_OUT);
+    }
     atdat->lts = bpf_ktime_get_ns();
     axtdat->lts = atdat->lts;
     if (atdat->ctd.dir == CT_DIR_IN) {
@@ -1936,6 +2024,27 @@ dp_ct_in(void *ctx, struct xfi *xf)
         axtdat->ca.act_type = DP_SET_NOP;
       }
     } else if (smr == CT_SMR_ERR || smr == CT_SMR_CTD) {
+      if (key.l4proto == IPPROTO_TCP && smr == CT_SMR_CTD &&
+          !(xf->pm.tcp_flags & LLB_TCP_RST) && dp_ct_tcp_terminal(atdat)) {
+        /* A final ACK observed here can still be lost downstream. Retain
+         * reverse NAT for retransmitted FIN/ACK until the existing CW GC.
+         * Release the active session now, once, retaining only its mapping.
+         * Never retain an FC action that could bypass the terminal deadline.
+         */
+        dp_ct_related_fc_rm(&xkey);
+        dp_ct_related_fc_rm(&key);
+        int release;
+
+        if (atdat->ctd.dir == CT_DIR_IN) {
+          release = dp_ct_release_terminal(atdat, axtdat);
+        } else {
+          release = dp_ct_release_terminal(axtdat, atdat);
+        }
+        if (release) {
+          dp_do_dec_nat_sess(ctx, xf, atdat->ctd.rid, atdat->ctd.aid);
+        }
+        return smr;
+      }
       bpf_map_delete_elem(&ct_map, &xkey);
       bpf_map_delete_elem(&ct_map, &key);
       dp_ct_related_fc_rm(&xkey);

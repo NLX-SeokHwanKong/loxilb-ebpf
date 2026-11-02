@@ -336,6 +336,15 @@ dp_pipe_check_res(void *ctx, struct xfi *xf, void *fa)
         xf->pm.rcode |= LLB_PIPE_RC_RESOLVE;
         dp_ring_event(ctx, xf, 1);
       }
+      /* Complete plain SNAT before handing the packet to the kernel.
+       * SCTP checksum completion resumes here with nf cleared.
+       */
+      if ((xf->pm.nf & LLB_NAT_SRC) && !xf->nm.dsr &&
+          !xf->tm.new_tunnel_id && !xf->tm.tun_decap) {
+        if (dp_unparse_packet(ctx, xf, 1) != 0) {
+          return DP_DROP;
+        }
+      }
       return DP_PASS;
     }
 #else
