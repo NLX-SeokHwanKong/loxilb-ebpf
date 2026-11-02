@@ -1794,6 +1794,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
   xi->dsr = xf->nm.dsr;
 
   xxi->nat_flags = 0;
+  xxi->dsr = 0;
   xxi->nat_xport = 0;
   DP_XADDR_SETZR(xxi->nat_xip);
   DP_XADDR_SETZR(xxi->nat_rip);
