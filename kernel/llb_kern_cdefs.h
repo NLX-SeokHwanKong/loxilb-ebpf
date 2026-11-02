@@ -830,9 +830,26 @@ dp_ring_event(void *ctx,  struct xfi *xf, int cp)
   if (xf->l2m.dl_type == bpf_ntohs(ETH_P_IP)) {
     pmd->resolve_ip = xf->l34m.daddr[0];
     if (xf->pm.nf & LLB_NAT_DST) {
-      pmd->resolve_ip = xf->nm.nxip4;
+      pmd->resolve_ip = xf->nm.nxip4 ?: xf->l34m.saddr4;
     } else if (xf->pm.nf & LLB_NAT_SRC) {
-      pmd->resolve_ip = xf->nm.nrip4;
+      if (xf->nm.nrip4) {
+        pmd->resolve_ip = xf->nm.nrip4;
+      } else if (xf->nm.nxip4 == 0) {
+        /* Hairpin SNAT swaps the original source and destination. */
+        pmd->resolve_ip = xf->l34m.saddr4;
+      }
+    }
+    /* CRC clears nf; UDP hairpin DNAT updates saddr before resolution. */
+    if (((!xf->pm.nf && xf->pm.nfc) ||
+         ((xf->pm.nf & LLB_NAT_DST) && !xf->nm.nxip4 &&
+          xf->l34m.nw_proto == IPPROTO_UDP)) &&
+        !xf->tm.new_tunnel_id && !xf->tm.tun_decap) {
+      struct iphdr *iph = DP_ADD_PTR(DP_PDATA(ctx), xf->pm.l3_off);
+      void *dend = DP_TC_PTR(DP_PDATA_END(ctx));
+
+      if (iph + 1 <= dend) {
+        pmd->resolve_ip = iph->daddr;
+      }
     }
   } else {
     pmd->resolve_ip = 0;
