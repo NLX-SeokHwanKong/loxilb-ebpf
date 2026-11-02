@@ -2993,7 +2993,10 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
          used1, used2);
     ll_send_ctep_reset(key, adat);
     llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
-    if (adat->ctd.xi.nat_flags) {
+    /* A retained terminal TCP mapping has already released its session. */
+    if (adat->ctd.xi.nat_flags &&
+        !(key->l4proto == IPPROTO_TCP &&
+          adat->ctd.pi.t.state == CT_TCP_CW && adat->ctd.smr == CT_SMR_CTD)) {
       llb_nat_dec_act_sessions(adat->ctd.rid, adat->ctd.aid);
     }
 

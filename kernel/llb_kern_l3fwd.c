@@ -279,7 +279,9 @@ dp_do_ctops(void *ctx, struct xfi *xf, void *fa_,
   }
 
   xf->pm.phit |= LLB_DP_CTM_HIT;
-  act->lts = bpf_ktime_get_ns();
+  if (xf->l34m.nw_proto != IPPROTO_TCP || !dp_ct_tcp_terminal(act)) {
+    act->lts = bpf_ktime_get_ns();
+  }
 
 #ifdef HAVE_DP_FC
   fa->ca.cidx = act->ca.cidx;
@@ -393,6 +395,31 @@ dp_do_ingress_ct(void *ctx, struct xfi *xf, void *fa_)
 
   xf->pm.table_id = LL_DP_CT_MAP;
   act = bpf_map_lookup_elem(&ct_map, &key);
+  if (act && key.l4proto == IPPROTO_TCP && dp_ct_tcp_terminal(act)) {
+    __u64 now = bpf_ktime_get_ns();
+
+    /* New client SYNs must select from the current rule, not the closed
+     * connection's endpoint. Enforce the existing FIN timeout even before
+     * the next userspace sweep, without refreshing it on late packets.
+     */
+    if ((act->ctd.dir == CT_DIR_IN &&
+         (xf->pm.tcp_flags & (LLB_TCP_SYN|LLB_TCP_ACK)) == LLB_TCP_SYN) ||
+        (now >= act->lts && now - act->lts > CT_TCP_FN_CPTO)) {
+      struct dp_ct_key xkey;
+      nxfrm_inf_t reverse = {};
+
+      dp_ct_proto_xfk_init(&key, &act->ctd.xi, &xkey, &reverse);
+      if (bpf_map_delete_elem(&ct_map, &key) == 0) {
+        bpf_map_delete_elem(&ct_map, &xkey);
+        dp_ct_related_fc_rm(&key);
+        dp_ct_related_fc_rm(&xkey);
+        if (act->ctd.smr != CT_SMR_CTD) {
+          dp_do_dec_nat_sess(ctx, xf, act->ctd.rid, act->ctd.aid);
+        }
+      }
+      act = NULL;
+    }
+  }
   if (!act) {
     BPF_DBG_PRINTK("[CT] miss");
   }

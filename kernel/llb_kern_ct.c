@@ -1740,6 +1740,28 @@ dp_ct_ctd(struct xfi *xf,
 }
 
 static int __always_inline
+dp_ct_tcp_terminal(struct dp_ct_tact *act)
+{
+  return act->ctd.xi.nat_flags && !act->ctd.xi.dsr &&
+         act->ctd.pi.t.state == CT_TCP_CW;
+}
+
+static int __always_inline
+dp_ct_release_terminal(struct dp_ct_tact *forward, struct dp_ct_tact *reverse)
+{
+  int release = 0;
+
+  bpf_spin_lock(&forward->lock);
+  if (forward->ctd.smr != CT_SMR_CTD) {
+    forward->ctd.smr = CT_SMR_CTD;
+    reverse->ctd.smr = CT_SMR_CTD;
+    release = 1;
+  }
+  bpf_spin_unlock(&forward->lock);
+  return release;
+}
+
+static int __always_inline
 dp_ct_in(void *ctx, struct xfi *xf)
 {
   struct dp_ct_key key;
@@ -1960,6 +1982,16 @@ dp_ct_in(void *ctx, struct xfi *xf)
   }
 
   if (atdat != NULL && axtdat != NULL) {
+    /* Keep only the transform during the existing FIN cleanup interval.
+     * Retransmissions must not move the terminal pair's cleanup deadline.
+     */
+    if (key.l4proto == IPPROTO_TCP && dp_ct_tcp_terminal(atdat)) {
+      /* Preserve per-direction PPv2 sequence fixup on late segments too. */
+      if (atdat->ctd.dir == CT_DIR_IN) {
+        return dp_ct_tcp_sm(ctx, xf, atdat, axtdat, CT_DIR_IN);
+      }
+      return dp_ct_tcp_sm(ctx, xf, axtdat, atdat, CT_DIR_OUT);
+    }
     atdat->lts = bpf_ktime_get_ns();
     axtdat->lts = atdat->lts;
     if (atdat->ctd.dir == CT_DIR_IN) {
@@ -1992,6 +2024,27 @@ dp_ct_in(void *ctx, struct xfi *xf)
         axtdat->ca.act_type = DP_SET_NOP;
       }
     } else if (smr == CT_SMR_ERR || smr == CT_SMR_CTD) {
+      if (key.l4proto == IPPROTO_TCP && smr == CT_SMR_CTD &&
+          !(xf->pm.tcp_flags & LLB_TCP_RST) && dp_ct_tcp_terminal(atdat)) {
+        /* A final ACK observed here can still be lost downstream. Retain
+         * reverse NAT for retransmitted FIN/ACK until the existing CW GC.
+         * Release the active session now, once, retaining only its mapping.
+         * Never retain an FC action that could bypass the terminal deadline.
+         */
+        dp_ct_related_fc_rm(&xkey);
+        dp_ct_related_fc_rm(&key);
+        int release;
+
+        if (atdat->ctd.dir == CT_DIR_IN) {
+          release = dp_ct_release_terminal(atdat, axtdat);
+        } else {
+          release = dp_ct_release_terminal(axtdat, atdat);
+        }
+        if (release) {
+          dp_do_dec_nat_sess(ctx, xf, atdat->ctd.rid, atdat->ctd.aid);
+        }
+        return smr;
+      }
       bpf_map_delete_elem(&ct_map, &xkey);
       bpf_map_delete_elem(&ct_map, &key);
       dp_ct_related_fc_rm(&xkey);
