@@ -285,6 +285,9 @@ dp_ct3_sm(struct dp_ct_dat *tdat,
   return 0;
 }
 
+#define CT_TCP_FIN_SEEN  0x1
+#define CT_TCP_FIN_ACKED 0x2
+
 static int __always_inline
 dp_ct_tcp_sm(void *ctx, struct xfi *xf, 
              struct dp_ct_tact *atdat,
@@ -346,6 +349,58 @@ dp_ct_tcp_sm(void *ctx, struct xfi *xf,
 
   if (tcp_flags & LLB_TCP_RST) {
     nstate = CT_TCP_CW;
+    goto end;
+  }
+
+  /* NAT needs both FINs acknowledged before discarding the reverse transform.
+   * In a simultaneous close, FIN+ACK need not acknowledge the peer's FIN.
+   * hstate is per-direction close tracking; seq holds FIN's sequence-space end
+   * only after FIN_SEEN. Keep DSR's early release and non-NAT handling below.
+   */
+  if (tdat->xi.nat_flags && !tdat->xi.dsr &&
+      (ts->state == CT_TCP_EST || ts->state == CT_TCP_PEST ||
+       ts->state == CT_TCP_FINI || ts->state == CT_TCP_FINI2 ||
+       ts->state == CT_TCP_FINI3) &&
+      ((tcp_flags & LLB_TCP_FIN) || (ts->state & CT_TCP_FIN_MASK))) {
+    __u32 close_ack = ack;
+
+    if ((tcp_flags & LLB_TCP_FIN) && !(td->hstate & CT_TCP_FIN_SEEN)) {
+      __u32 thlen = (__u32)t->doff << 2;
+
+      if (thlen < sizeof(*t) || thlen > xf->pm.l3_plen) {
+        nstate = CT_TCP_ERR;
+        goto end;
+      }
+      if (!(ts->tcp_cts[0].hstate & CT_TCP_FIN_SEEN) &&
+          !(ts->tcp_cts[1].hstate & CT_TCP_FIN_SEEN)) {
+        ts->fndir = dir;
+      }
+      td->seq = seq + (xf->pm.l3_plen - thlen) + 1;
+      td->hstate |= CT_TCP_FIN_SEEN;
+    }
+
+#ifdef LL_TC_EBPF
+    /* Backend ACKs include the inserted PPv2 header; client SEQs do not. */
+    if (dir == CT_DIR_OUT && td->ppv2) {
+      close_ack -= sizeof(struct proxy_hdr_v2) +
+                   (dp_is_ppv2_ipv6(xf) ? sizeof(struct proxy_ipv6_hdr) :
+                                           sizeof(struct proxy_ipv4_hdr));
+    }
+#endif
+    if ((tcp_flags & LLB_TCP_ACK) && (rtd->hstate & CT_TCP_FIN_SEEN) &&
+        close_ack == rtd->seq) {
+      rtd->hstate |= CT_TCP_FIN_ACKED;
+    }
+
+    if ((td->hstate & CT_TCP_FIN_SEEN) &&
+        (rtd->hstate & CT_TCP_FIN_SEEN)) {
+      nstate = ((td->hstate & CT_TCP_FIN_ACKED) &&
+                (rtd->hstate & CT_TCP_FIN_ACKED)) ? CT_TCP_CW : CT_TCP_FINI3;
+    } else {
+      ct_tcp_pinfd_t *first = &ts->tcp_cts[ts->fndir == CT_DIR_IN ? 0 : 1];
+
+      nstate = (first->hstate & CT_TCP_FIN_ACKED) ? CT_TCP_FINI2 : CT_TCP_FINI;
+    }
     goto end;
   }
 
