@@ -2583,13 +2583,10 @@ llb_cid_detach_match(const struct llb_cid_detach *detach,
          llb_cid_reply_contains(detach->arms, detach->count, arm);
 }
 
-static int
-llb_cid_detach_ct(int tid, void *k, void *arg)
+static bool
+llb_cid_ct_owned(const struct llb_cid_detach *detach, const struct dp_ct_key *key,
+                 const struct dp_ct_tact *entry)
 {
-  const struct dp_ct_key *key = k;
-  dp_map_ita_t *it = arg;
-  struct llb_cid_detach *detach = it->uarg;
-  const struct dp_ct_tact *entry = it->val;
   const struct mf_xfrm_inf *nat = &entry->ctd.xi;
 
   if (key->v6 || key->l4proto != IPPROTO_UDP || key->ident || key->type ||
@@ -2612,21 +2609,26 @@ llb_cid_detach_ct(int tid, void *k, void *arg)
     return 0;
   }
 
-  if (!match)
+  return match;
+}
+
+static int
+llb_cid_detach_ct(int tid, void *key, void *arg)
+{
+  dp_map_ita_t *it = arg;
+  struct llb_cid_detach *detach = it->uarg;
+  const struct dp_ct_tact *entry = it->val;
+  if (!llb_cid_ct_owned(detach, key, entry))
     return 0;
   llb_clear_map_stats(LL_DP_CT_STATS_MAP, entry->ca.cidx);
   detach->ct_entries++;
   return 1;
 }
 
-static int
-llb_cid_detach_fc(int tid, void *k, void *arg)
+static bool
+llb_cid_fc_owned(const struct llb_cid_detach *detach, const struct dp_fcv4_key *key,
+                 const struct dp_fc_tacts *fc)
 {
-  const struct dp_fcv4_key *key = k;
-  dp_map_ita_t *it = arg;
-  struct llb_cid_detach *detach = it->uarg;
-  const struct dp_fc_tacts *fc = it->val;
-
   if (key->l4proto != IPPROTO_UDP || fc->zone != detach->service->zone)
     return 0;
 
@@ -2650,7 +2652,15 @@ llb_cid_detach_fc(int tid, void *k, void *arg)
     return 0;
   }
 
-  if (!match)
+  return match;
+}
+
+static int
+llb_cid_detach_fc(int tid, void *key, void *arg)
+{
+  dp_map_ita_t *it = arg;
+  struct llb_cid_detach *detach = it->uarg;
+  if (!llb_cid_fc_owned(detach, key, it->val))
     return 0;
   detach->fc_entries++;
   return 1;
@@ -2681,6 +2691,83 @@ llb_cid_detach_flows(const struct dp_nat_key *service, uint32_t rid,
   llb_map_loop_and_delete(LL_DP_FCV4_MAP, llb_cid_detach_fc, &fc_walk);
   log_info("CID detach: rid=%u port=%u arms=%u CT=%u FC=%u",
            rid, ntohs(service->dport), count, detach.ct_entries, detach.fc_entries);
+}
+
+/* The coordinator exclusively owns and fences both data ports before entry.
+ * Get the successor before deleting the current key. A failed read/delete
+ * or incomplete traversal must never be reported as a drained service. */
+static int
+llb_cid_handoff_walk(const struct llb_cid_detach *scope, int table,
+                     bool verify, unsigned int *removed)
+{
+  union { struct dp_ct_key ct; struct dp_fcv4_key fc; } key = {}, next = {};
+  union { struct dp_ct_tact ct; struct dp_fc_tacts fc; } value;
+  llb_dp_map_t *map = &xh->maps[table];
+  int fd = map->map_fd;
+  if (fd <= 0)
+    return -EBADF;
+  int more = bpf_map_get_next_key(fd, NULL, &key);
+  for (uint32_t n = 0; more == 0; n++) {
+    if (n >= map->max_entries)
+      return -EAGAIN;
+    if (bpf_map_lookup_elem(fd, &key, &value) != 0)
+      return -errno;
+    more = bpf_map_get_next_key(fd, &key, &next);
+    if (more && errno != ENOENT)
+      return -errno;
+    bool owned = table == LL_DP_CT_MAP
+                 ? llb_cid_ct_owned(scope, &key.ct, &value.ct)
+                 : llb_cid_fc_owned(scope, &key.fc, &value.fc);
+    if (owned) {
+      if (verify)
+        return -EBUSY;
+      if (bpf_map_delete_elem(fd, &key) != 0)
+        return -errno;
+      if (table == LL_DP_CT_MAP)
+        llb_clear_map_stats(LL_DP_CT_STATS_MAP, value.ct.ca.cidx);
+      (*removed)++;
+    }
+    if (more)
+      return 0;
+    key = next;
+  }
+  return errno == ENOENT ? 0 : -errno;
+}
+
+int
+llb_cid_handoff_drain(uint32_t vip, uint16_t zone, uint16_t port,
+                      uint32_t rid, unsigned int *ct, unsigned int *fc)
+{
+  struct dp_nat_key service = {.daddr = {vip}, .dport = port,
+                               .zone = zone, .l4proto = IPPROTO_UDP};
+  struct dp_proxy_tacts nat;
+  struct dp_cid_reply_key arms[LLB_MAX_NXFRMS];
+  int ret = -ESTALE;
+  if (!vip || !port || !zone || !rid || !ct || !fc || !xh || xh->have_noebpf)
+    return -EINVAL;
+  *ct = *fc = 0;
+  XH_LOCK();
+  if (bpf_map_lookup_elem(llb_map2fd(LL_DP_NAT_MAP), &service, &nat) != 0) {
+    ret = -errno;
+    goto out;
+  }
+  if (nat.ca.cidx != rid || !nat.nxfrm || nat.nxfrm > LLB_MAX_NXFRMS)
+    goto out;
+  for (unsigned i = 0; i < nat.nxfrm; i++)
+    if (nat.nxfrms[i].nv6 || nat.nxfrms[i].dsr ||
+        nat.nxfrms[i].nat_rip[0] != vip || !nat.nxfrms[i].nat_xip[0])
+      goto out;
+  unsigned count = llb_cid_reply_keys(&service, &nat, arms);
+  if (!count)
+    goto out;
+  struct llb_cid_detach scope = {.service=&service, .rid=rid, .arms=arms, .count=count};
+  ret = llb_cid_handoff_walk(&scope, LL_DP_FCV4_MAP, false, fc);
+  if (!ret) ret = llb_cid_handoff_walk(&scope, LL_DP_CT_MAP, false, ct);
+  if (!ret) ret = llb_cid_handoff_walk(&scope, LL_DP_FCV4_MAP, true, fc);
+  if (!ret) ret = llb_cid_handoff_walk(&scope, LL_DP_CT_MAP, true, ct);
+out:
+  XH_UNLOCK();
+  return ret;
 }
 
 /* Called under the same lock as registration and NAT publication. */
