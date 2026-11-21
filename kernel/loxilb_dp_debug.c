@@ -8,7 +8,8 @@ extern int llb_setup_pkt_ring(void);
 
 /* ct_fail_stats_map indices, see enum llb_ct_fail */
 static const char *ct_fail_names[LLB_CT_FAIL_MAX] = {
-  "map-full", "half-insert", "xkey-exist", "xkey-miss"
+  "map-full", "half-insert", "xkey-exist", "xkey-miss", "cid-reply", "cid-retired",
+  "cid-withdrawn"
 };
 
 static void

@@ -526,9 +526,8 @@ dp_ingress_ct_main(struct __sk_buff *ctx,  struct xfi *xf)
       dp_record_it(ctx, xf);
     }
 
-    if (!(xf->pm.dp_mark & LLB_MARK_NAT)) {
-      dp_do_nat(ctx, xf);
-    }
+    if (!(xf->pm.dp_mark & LLB_MARK_NAT) && dp_do_nat(ctx, xf) < 0)
+      goto res_end;
 
 #ifdef HAVE_DP_LBMODE_ONLY
     if ((xf->pm.phit & LLB_DP_NAT_HIT) == 0) {

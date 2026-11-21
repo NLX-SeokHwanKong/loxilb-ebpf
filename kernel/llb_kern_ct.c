@@ -1695,6 +1695,69 @@ dp_ct_ctd(struct xfi *xf,
   return 0;
 }
 
+#ifdef HAVE_DP_QUIC_CID
+/* A reservation configured before VIP publication identifies the backend
+ * side of an IPv4 UDP FullNAT CID rule. A reply can arrive before the first
+ * client packet reaches a replacement LB. Without this check, it creates
+ * an un-NATed pair and occupies the reverse key required by FullNAT.
+ *
+ * Only a conntrack miss can hit the reservation. An existing NAT reply
+ * follows the ordinary return path, and a packet that matched a frontend
+ * NAT rule is still processed as a new forward flow.
+ */
+#ifdef HAVE_LEGACY_BPF_MAPS
+struct bpf_map_def SEC("maps") cid_reply_guard = {
+  .type = BPF_MAP_TYPE_HASH,
+  .key_size = sizeof(struct dp_cid_reply_key),
+  .value_size = sizeof(__u32),
+  .max_entries = LLB_CID_REPLY_GUARD_ENTRIES
+};
+#else
+struct cid_reply_guard_d {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, struct dp_cid_reply_key);
+  __type(value, __u32);
+  __uint(max_entries, LLB_CID_REPLY_GUARD_ENTRIES);
+} cid_reply_guard SEC(".maps");
+#endif
+
+#ifdef HAVE_LEGACY_BPF_MAPS
+struct bpf_map_def SEC("maps") cid_retired = {
+  .type = BPF_MAP_TYPE_LRU_HASH,
+  .key_size = sizeof(struct dp_cid_reply_key),
+  .value_size = sizeof(__u64),
+  .max_entries = LLB_CID_RETIRED_ENTRIES
+};
+#else
+struct cid_retired_d {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct dp_cid_reply_key);
+  __type(value, __u64);
+  __uint(max_entries, LLB_CID_RETIRED_ENTRIES);
+} cid_retired SEC(".maps");
+#endif
+
+static int __always_inline
+dp_ct_cid_orphan(const struct dp_ct_key *key)
+{
+  struct dp_cid_reply_key reply = {
+    .vip = key->daddr[0],
+    .backend = key->saddr[0],
+    .sport = key->sport,
+    .zone = key->zone
+  };
+  const __u32 *refs = bpf_map_lookup_elem(&cid_reply_guard, &reply);
+  if (refs && *refs)
+    return LLB_CT_FAIL_CID_REPLY;
+
+  int withdrawn = refs != NULL;
+  const __u64 *until = bpf_map_lookup_elem(&cid_retired, &reply);
+  if (until && *until > bpf_ktime_get_ns())
+    return LLB_CT_FAIL_CID_RETIRED;
+  return withdrawn ? LLB_CT_FAIL_CID_WITHDRAWN : -1;
+}
+#endif
+
 static int __always_inline
 dp_ct_in(void *ctx, struct xfi *xf)
 {
@@ -1768,7 +1831,17 @@ dp_ct_in(void *ctx, struct xfi *xf)
 
   atdat = bpf_map_lookup_elem(&ct_map, &key);
   if (atdat == NULL) {
-
+#ifdef HAVE_DP_QUIC_CID
+    if (key.l4proto == IPPROTO_UDP && !key.v6 &&
+        !key.ident && !key.type && !xf->l2m.ssnid && !xi->nat_flags) {
+      int reason = dp_ct_cid_orphan(&key);
+      if (reason >= 0) {
+        dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, reason);
+        LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
+        return 0;
+      }
+    }
+#endif
     if (xf->nm.dsr && key.l4proto == IPPROTO_TCP &&
         !(xf->pm.tcp_flags & LLB_TCP_SYN)) {
       /* DSR releases the entry at the client's FIN. A later empty segment

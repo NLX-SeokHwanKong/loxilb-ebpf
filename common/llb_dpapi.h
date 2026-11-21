@@ -173,6 +173,8 @@ enum llb_dp_tid {
   LL_DP_SOCK_RWR_MAP,
   LL_DP_SOCK_PROXY_MAP,
   LL_DP_CT_FAIL_STATS_MAP,
+  LL_DP_CID_REPLY_GUARD_MAP,
+  LL_DP_CID_RETIRED_MAP,
   LL_DP_MAX_MAP
 };
 
@@ -184,6 +186,9 @@ enum llb_ct_fail {
   LLB_CT_FAIL_HALF_INS,     /* only the reverse entry fit, rolled back */
   LLB_CT_FAIL_XKEY_EXIST,   /* reverse key present without the forward key */
   LLB_CT_FAIL_XKEY_MISS,    /* forward key present without the reverse key */
+  LLB_CT_FAIL_CID_REPLY,   /* guarded FullNAT reply without conntrack */
+  LLB_CT_FAIL_CID_RETIRED, /* late reply from an arm removed from NAT */
+  LLB_CT_FAIL_CID_WITHDRAWN, /* withdrawn arm with no live LRU hint */
   LLB_CT_FAIL_MAX
 };
 
@@ -844,6 +849,9 @@ struct dp_nat_key {
 #define NAT_LB_SEL_N3 6
 #define NAT_LB_SEL_QUIC_CID 7
 
+#define LLB_QUIC_PROFILE_LEGACY   0
+#define LLB_QUIC_PROFILE_MVFST_V3 1
+
 #define NAT_LB_PERSIST_TIMEOUT (10800000000000ULL)
 
 #define SEC_MODE_NONE 0
@@ -851,6 +859,19 @@ struct dp_nat_key {
 #define SEC_MODE_HTTPS_E2E 2
 
 #define NAT_LB_OP_CHKSRC 0x1
+#define NAT_LB_OP_CID_REPLY_GUARD 0x2
+
+#define LLB_CID_RETIRED_ENTRIES LLB_NATV4_MAP_ENTRIES
+#define LLB_CID_RETIRED_MIN_NS (60000000000ULL)
+/* The non-LRU reply guard stores active references. Zero reserves a withdrawn key. */
+#define LLB_CID_REPLY_GUARD_ENTRIES (LLB_NATV4_MAP_ENTRIES * LLB_MAX_NXFRMS)
+
+struct dp_cid_reply_key {
+  __u32 vip;
+  __u32 backend;
+  __u16 sport;
+  __u16 zone;
+};
 
 struct dp_proxy_tacts {
   struct dp_cmn_act ca;
@@ -867,7 +888,8 @@ struct dp_proxy_tacts {
   uint8_t ppv2;
   uint8_t quic_sid_len;     /* NAT_LB_SEL_QUIC_CID only */
   uint8_t quic_cr;          /* NAT_LB_SEL_QUIC_CID only */
-  uint8_t pad1[5];
+  uint8_t quic_profile;     /* NAT_LB_SEL_QUIC_CID only */
+  uint8_t pad1[4];
   uint64_t lts;
   uint64_t base_to;
   uint32_t pmhh[LLB_MAX_MHOSTS];

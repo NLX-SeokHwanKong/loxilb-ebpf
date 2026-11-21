@@ -226,6 +226,12 @@ dp_do_nat(void *ctx, struct xfi *xf)
   if (act->ca.act_type == DP_SET_SNAT || 
       act->ca.act_type == DP_SET_DNAT) {
     sel = dp_sel_nat_ep(ctx, xf, act);
+#ifdef HAVE_DP_QUIC_CID
+    if (sel == QUIC_CID_NO_ACTIVE_SID) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_UNK);
+      return -1;
+    }
+#endif
 
     xf->nm.dsr = act->ca.oaux ? 1: 0;
     xf->nm.cdis = act->cdis ? 1: 0;

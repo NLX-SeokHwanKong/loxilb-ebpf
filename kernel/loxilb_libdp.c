@@ -1625,6 +1625,11 @@ llb_xh_init(llb_dp_struct_t *xh)
                                                  sizeof(struct dp_pbc_stats));
   assert(xh->maps[LL_DP_CT_FAIL_STATS_MAP].pbs);
 
+  xh->maps[LL_DP_CID_REPLY_GUARD_MAP].map_name = "cid_reply_guard";
+  xh->maps[LL_DP_CID_REPLY_GUARD_MAP].max_entries = LLB_CID_REPLY_GUARD_ENTRIES;
+  xh->maps[LL_DP_CID_RETIRED_MAP].map_name = "cid_retired";
+  xh->maps[LL_DP_CID_RETIRED_MAP].max_entries = LLB_CID_RETIRED_ENTRIES;
+
   xh->maps[LL_DP_PPLAT_MAP].map_name = "pplat_map";
   xh->maps[LL_DP_PPLAT_MAP].has_pb   = 1;
   xh->maps[LL_DP_PPLAT_MAP].max_entries = LLB_PPLAT_MAP_ENTRIES;
@@ -2375,15 +2380,574 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   return 0;
 }
 
+/* Called under XH_LOCK with the NAT map update. The guard is shared
+ * by rules whose backend and translated source use the same tuple.
+ * Health changes retain reservations for configured endpoints so late
+ * replies cannot acquire a generic CT pair during temporary inactivity.
+ */
+static bool
+llb_cid_reply_contains(const struct dp_cid_reply_key *keys, unsigned int count,
+                      const struct dp_cid_reply_key *key)
+{
+  for (unsigned int i = 0; i < count; i++) {
+    if (memcmp(&keys[i], key, sizeof(*key)) == 0)
+      return true;
+  }
+  return false;
+}
+
+static unsigned int
+llb_cid_reply_keys(const struct dp_nat_key *key, const struct dp_proxy_tacts *nat,
+                  struct dp_cid_reply_key *keys)
+{
+  unsigned int count = 0;
+
+  if (!nat || key->v6 || key->l4proto != IPPROTO_UDP ||
+      nat->ca.act_type != DP_SET_DNAT || nat->sel_type != NAT_LB_SEL_QUIC_CID ||
+      !(nat->opflags & NAT_LB_OP_CID_REPLY_GUARD))
+    return 0;
+
+  for (unsigned int i = 0; i < nat->nxfrm && i < LLB_MAX_NXFRMS; i++) {
+    const struct mf_xfrm_inf *ep = &nat->nxfrms[i];
+    struct dp_cid_reply_key guard = {
+      .vip = ep->nat_rip[0],
+      .backend = ep->nat_xip[0],
+      .sport = ep->nat_xport ? ep->nat_xport : key->dport,
+      .zone = key->zone
+    };
+
+    if (!ep->nv6 && guard.vip && guard.backend && guard.sport &&
+        !llb_cid_reply_contains(keys, count, &guard))
+      keys[count++] = guard;
+  }
+  return count;
+}
+
+/* The high bit records a prior withdrawal while other rules own this key.
+ * Zero is the dormant representation understood by the packet path. A live
+ * key always has a positive count, even when withdrawal history is retained.
+ * Keep that history until the last rule for this reply VIP and zone is gone.
+ */
+#define CID_REPLY_WITHDRAWN (1U << 31)
+#define CID_REPLY_REFS      (CID_REPLY_WITHDRAWN - 1U)
+
+static int
+llb_cid_reply_acquire(const struct dp_cid_reply_key *key)
+{
+  int fd = llb_map2fd(LL_DP_CID_REPLY_GUARD_MAP);
+  __u32 refs;
+
+  if (bpf_map_lookup_elem(fd, key, &refs) == 0) {
+    bool withdrawn = refs == 0;
+    if ((refs & CID_REPLY_REFS) == CID_REPLY_REFS) {
+      errno = EOVERFLOW;
+      return -1;
+    }
+    if (withdrawn)
+      refs = CID_REPLY_WITHDRAWN;
+    refs++;
+    if (bpf_map_update_elem(fd, key, &refs, BPF_EXIST) != 0)
+      return -1;
+    return withdrawn ? 2 : 0;
+  }
+  if (errno != ENOENT)
+    return -1;
+
+  refs = 1;
+  if (bpf_map_update_elem(fd, key, &refs, BPF_NOEXIST) != 0)
+    return -1;
+  return 1;
+}
+
+static int
+llb_cid_reply_release(const struct dp_cid_reply_key *key, bool keep)
+{
+  int fd = llb_map2fd(LL_DP_CID_REPLY_GUARD_MAP);
+  __u32 refs;
+
+  if (bpf_map_lookup_elem(fd, key, &refs) != 0) {
+    log_error("CID reply guard: lookup on release failed (%d)", errno);
+    return -1;
+  }
+
+  int ret;
+  if ((refs & CID_REPLY_REFS) > 1) {
+    refs--;
+    if (keep)
+      refs |= CID_REPLY_WITHDRAWN;
+    ret = bpf_map_update_elem(fd, key, &refs, BPF_EXIST);
+  } else if (keep || (refs & CID_REPLY_WITHDRAWN)) {
+    refs = 0;
+    ret = bpf_map_update_elem(fd, key, &refs, BPF_EXIST);
+  } else {
+    ret = bpf_map_delete_elem(fd, key);
+  }
+  if (ret != 0)
+    log_error("CID reply guard: release failed (%d)", errno);
+  return ret;
+}
+
+struct llb_cid_reply_prune {
+  const struct dp_cid_reply_key *keys;
+  unsigned int count;
+  unsigned int removed;
+};
+
+static bool
+llb_cid_reply_plain(const struct dp_ct_tact *entry)
+{
+  return entry->ctd.rid == 0 && entry->ctd.xi.nat_flags == 0 &&
+         (entry->ca.act_type == DP_SET_DO_CT || entry->ca.act_type == DP_SET_NOP);
+}
+
+static int
+llb_cid_reply_prune_pair(int tid, void *k, void *arg)
+{
+  const struct dp_ct_key *key = k;
+  dp_map_ita_t *it = arg;
+  struct llb_cid_reply_prune *prune = it->uarg;
+  const struct dp_ct_tact *entry = it->val;
+  struct dp_ct_tact other;
+
+  if (key->l4proto != IPPROTO_UDP || key->v6 || key->type || key->ident ||
+      entry->ctd.dir != CT_DIR_IN || entry->ctd.pi.frag ||
+      entry->ctd.pi.u.rpkts_seen || !llb_cid_reply_plain(entry))
+    return 0;
+
+  struct dp_cid_reply_key guard = {
+    .vip = key->daddr[0],
+    .backend = key->saddr[0],
+    .sport = key->sport,
+    .zone = key->zone
+  };
+  if (!llb_cid_reply_contains(prune->keys, prune->count, &guard))
+    return 0;
+
+  struct dp_ct_key reverse = *key;
+  DP_XADDR_CP(reverse.daddr, key->saddr);
+  DP_XADDR_CP(reverse.saddr, key->daddr);
+  reverse.sport = key->dport;
+  reverse.dport = key->sport;
+
+  int fd = llb_map2fd(tid);
+  if (bpf_map_lookup_elem(fd, &reverse, &other) != 0 ||
+      other.ctd.dir != CT_DIR_OUT || !llb_cid_reply_plain(&other) ||
+      other.ca.cidx != entry->ca.cidx + 1)
+    return 0;
+
+  /* The newly installed guard prevents another untracked reply from
+   * recreating this pair. Leave existing NAT pairs and two-way UDP alone.
+   */
+  llb_maptrace_uhook(tid, 0, &reverse, sizeof(reverse), NULL, 0);
+  if (bpf_map_delete_elem(fd, &reverse) != 0 && errno != ENOENT)
+    return 0;
+  llb_clear_map_stats(LL_DP_CT_STATS_MAP, other.ca.cidx);
+  llb_clear_map_stats(LL_DP_CT_STATS_MAP, entry->ca.cidx);
+  prune->removed++;
+  return 1;
+}
+
+static void
+llb_cid_reply_prune_new(const struct dp_cid_reply_key *keys, unsigned int count)
+{
+  struct llb_cid_reply_prune prune = {.keys = keys, .count = count};
+  struct dp_ct_key next;
+  struct dp_ct_tact entry;
+  dp_map_ita_t walk = {
+    .next_key = &next, .key_sz = sizeof(next), .val = &entry, .uarg = &prune
+  };
+
+  if (count == 0)
+    return;
+  llb_map_loop_and_delete(LL_DP_CT_MAP, llb_cid_reply_prune_pair, &walk);
+  if (prune.removed)
+    log_info("CID reply guard: retired %u un-NATed UDP pairs", prune.removed);
+}
+
+struct llb_cid_detach {
+  const struct dp_nat_key *service;
+  const struct dp_cid_reply_key *arms;
+  unsigned int count;
+  uint32_t rid;
+  unsigned int ct_entries;
+  unsigned int fc_entries;
+};
+
+static bool
+llb_cid_detach_match(const struct llb_cid_detach *detach,
+                     const struct dp_cid_reply_key *arm, uint32_t service_ip,
+                     uint16_t service_port)
+{
+  return service_ip == detach->service->daddr[0] &&
+         service_port == detach->service->dport &&
+         llb_cid_reply_contains(detach->arms, detach->count, arm);
+}
+
+static int
+llb_cid_detach_ct(int tid, void *k, void *arg)
+{
+  const struct dp_ct_key *key = k;
+  dp_map_ita_t *it = arg;
+  struct llb_cid_detach *detach = it->uarg;
+  const struct dp_ct_tact *entry = it->val;
+  const struct mf_xfrm_inf *nat = &entry->ctd.xi;
+
+  if (key->v6 || key->l4proto != IPPROTO_UDP || key->ident || key->type ||
+      nat->nv6 || nat->dsr || entry->ctd.rid != detach->rid)
+    return 0;
+
+  struct dp_cid_reply_key arm = {.zone = key->zone};
+  bool match;
+  if (entry->ctd.dir == CT_DIR_IN && nat->nat_flags == LLB_NAT_DST) {
+    arm.vip = nat->nat_rip[0];
+    arm.backend = nat->nat_xip[0];
+    arm.sport = nat->nat_xport ? nat->nat_xport : key->dport;
+    match = llb_cid_detach_match(detach, &arm, key->daddr[0], key->dport);
+  } else if (entry->ctd.dir == CT_DIR_OUT && nat->nat_flags == LLB_NAT_SRC) {
+    arm.vip = key->daddr[0];
+    arm.backend = key->saddr[0];
+    arm.sport = key->sport;
+    match = llb_cid_detach_match(detach, &arm, nat->nat_xip[0], nat->nat_xport);
+  } else {
+    return 0;
+  }
+
+  if (!match)
+    return 0;
+  llb_clear_map_stats(LL_DP_CT_STATS_MAP, entry->ca.cidx);
+  detach->ct_entries++;
+  return 1;
+}
+
+static int
+llb_cid_detach_fc(int tid, void *k, void *arg)
+{
+  const struct dp_fcv4_key *key = k;
+  dp_map_ita_t *it = arg;
+  struct llb_cid_detach *detach = it->uarg;
+  const struct dp_fc_tacts *fc = it->val;
+
+  if (key->l4proto != IPPROTO_UDP || fc->zone != detach->service->zone)
+    return 0;
+
+  const struct dp_fc_tact *dnat = &fc->fcta[DP_SET_DNAT];
+  const struct dp_fc_tact *snat = &fc->fcta[DP_SET_SNAT];
+  struct dp_cid_reply_key arm = {.zone = fc->zone};
+  bool match;
+  if (dnat->ca.act_type == DP_SET_DNAT && dnat->nat_act.rid == detach->rid) {
+    const struct dp_nat_act *nat = &dnat->nat_act;
+    arm.vip = nat->rip[0];
+    arm.backend = nat->xip[0];
+    arm.sport = nat->xport ? nat->xport : key->dport;
+    match = llb_cid_detach_match(detach, &arm, key->daddr, key->dport);
+  } else if (snat->ca.act_type == DP_SET_SNAT && snat->nat_act.rid == detach->rid) {
+    const struct dp_nat_act *nat = &snat->nat_act;
+    arm.vip = key->daddr;
+    arm.backend = key->saddr;
+    arm.sport = key->sport;
+    match = llb_cid_detach_match(detach, &arm, nat->xip[0], nat->xport);
+  } else {
+    return 0;
+  }
+
+  if (!match)
+    return 0;
+  detach->fc_entries++;
+  return 1;
+}
+
+static void
+llb_cid_detach_flows(const struct dp_nat_key *service, uint32_t rid,
+                     const struct dp_cid_reply_key *arms, unsigned int count)
+{
+  if (!count || !rid)
+    return;
+
+  struct llb_cid_detach detach = {
+    .service = service, .arms = arms, .count = count, .rid = rid
+  };
+  struct dp_ct_key ct_key;
+  struct dp_ct_tact ct_entry;
+  dp_map_ita_t ct_walk = {
+    .next_key = &ct_key, .key_sz = sizeof(ct_key), .val = &ct_entry, .uarg = &detach
+  };
+  llb_map_loop_and_delete(LL_DP_CT_MAP, llb_cid_detach_ct, &ct_walk);
+
+  struct dp_fcv4_key fc_key;
+  struct dp_fc_tacts fc_entry;
+  dp_map_ita_t fc_walk = {
+    .next_key = &fc_key, .key_sz = sizeof(fc_key), .val = &fc_entry, .uarg = &detach
+  };
+  llb_map_loop_and_delete(LL_DP_FCV4_MAP, llb_cid_detach_fc, &fc_walk);
+  log_info("CID detach: rid=%u port=%u arms=%u CT=%u FC=%u",
+           rid, ntohs(service->dport), count, detach.ct_entries, detach.fc_entries);
+}
+
+/* Called under the same lock as registration and NAT publication. */
+static void
+llb_cid_retire_reply(const struct dp_cid_reply_key *key, uint64_t until)
+{
+  uint32_t refs;
+  if (bpf_map_lookup_elem(llb_map2fd(LL_DP_CID_REPLY_GUARD_MAP), key, &refs) != 0 ||
+      (refs & CID_REPLY_REFS) != 1)
+    return;
+
+  if (bpf_map_update_elem(llb_map2fd(LL_DP_CID_RETIRED_MAP), key, &until, BPF_ANY) != 0)
+    log_error("CID retired guard: update failed (%d)", errno);
+}
+
+static int
+llb_cid_retired_has_aged(int tid, void *key, void *arg)
+{
+  const dp_map_ita_t *it = arg;
+  const uint64_t *until = it->val;
+  const uint64_t *now = it->uarg;
+  return *until <= *now;
+}
+
+static void
+llb_cid_retired_age(uint64_t now)
+{
+  if (llb_map2fd(LL_DP_CID_RETIRED_MAP) <= 0)
+    return;
+
+  struct dp_cid_reply_key next;
+  uint64_t until;
+  dp_map_ita_t walk = {
+    .next_key = &next, .key_sz = sizeof(next), .val = &until, .uarg = &now
+  };
+  llb_map_loop_and_delete(LL_DP_CID_RETIRED_MAP, llb_cid_retired_has_aged, &walk);
+}
+
+static bool
+llb_cid_same_reply_vip(const struct dp_cid_reply_key *a,
+                      const struct dp_cid_reply_key *b)
+{
+  return a->vip == b->vip && a->zone == b->zone;
+}
+
+static bool
+llb_cid_reply_vip_in(const struct dp_cid_reply_key *key,
+                     const struct dp_cid_reply_key *keys, unsigned int count)
+{
+  for (unsigned int i = 0; i < count; i++) {
+    if (llb_cid_same_reply_vip(key, &keys[i]))
+      return true;
+  }
+  return false;
+}
+
+/* Called only when a rule stops owning a reply VIP. Check the published
+ * rules under XH_LOCK before releasing dormant keys shared by its ports.
+ */
+static bool
+llb_cid_reply_vip_owned(const struct dp_cid_reply_key *vip)
+{
+  int fd = llb_map2fd(LL_DP_NAT_MAP);
+  struct dp_nat_key next, prev;
+  const struct dp_nat_key *key = NULL;
+  struct dp_proxy_tacts nat;
+  struct dp_cid_reply_key keys[LLB_MAX_NXFRMS];
+
+  for (unsigned int i = 0; i < LLB_NATV4_MAP_ENTRIES; i++) {
+    if (bpf_map_get_next_key(fd, key, &next) != 0)
+      return errno != ENOENT;
+    prev = next;
+    key = &prev;
+    if (key->zone != vip->zone)
+      continue;
+    if (bpf_map_lookup_elem(fd, key, &nat) != 0)
+      return true;
+    unsigned int count = llb_cid_reply_keys(key, &nat, keys);
+    if (llb_cid_reply_vip_in(vip, keys, count))
+      return true;
+  }
+  return false;
+}
+
+static int
+llb_cid_reply_purge_key(int tid, void *key, void *arg)
+{
+  const dp_map_ita_t *it = arg;
+  const __u32 *refs = it->val;
+
+  return llb_cid_same_reply_vip(key, it->uarg) &&
+         (tid == LL_DP_CID_RETIRED_MAP || *refs == 0);
+}
+
+static void
+llb_cid_reply_purge_unowned(struct dp_cid_reply_key *keys, unsigned int count,
+                            const struct dp_cid_reply_key *retained, unsigned int retained_count)
+{
+  struct dp_cid_reply_key next;
+  uint64_t value;
+  dp_map_ita_t walk = {.next_key = &next, .key_sz = sizeof(next), .val = &value};
+
+  for (unsigned int i = 0; i < count; i++) {
+    if (llb_cid_reply_vip_in(&keys[i], keys, i) ||
+        llb_cid_reply_vip_in(&keys[i], retained, retained_count) ||
+        llb_cid_reply_vip_owned(&keys[i]))
+      continue;
+    walk.uarg = &keys[i];
+    llb_map_loop_and_delete(LL_DP_CID_REPLY_GUARD_MAP, llb_cid_reply_purge_key, &walk);
+    llb_map_loop_and_delete(LL_DP_CID_RETIRED_MAP, llb_cid_reply_purge_key, &walk);
+  }
+}
+
+/* XH_LOCK serializes NAT writers and GC. Reserve retry storage before
+ * publishing a guarded rule, including private rollback releases. */
+struct cid_pending_release {
+  struct dp_nat_key owner;
+  struct dp_cid_reply_key key;
+  bool keep;
+};
+static struct cid_pending_release *cid_pending;
+static unsigned int cid_pending_count, cid_pending_capacity;
+
+static void
+llb_cid_release_or_defer(const struct dp_nat_key *owner,
+                         const struct dp_cid_reply_key *key, bool keep)
+{
+  if (llb_cid_reply_release(key, keep) != 0)
+    cid_pending[cid_pending_count++] = (struct cid_pending_release){*owner, *key, keep};
+}
+
+static int
+llb_cid_retry_releases(const struct dp_nat_key *owner,
+                       const struct dp_cid_reply_key *old, unsigned int no,
+                       const struct dp_cid_reply_key *next, unsigned int nn)
+{
+  unsigned int remaining = 0;
+  int ret = 0;
+  for (unsigned int i = 0; i < cid_pending_count; i++) {
+    struct cid_pending_release item = cid_pending[i];
+    bool conflict = !owner || !memcmp(owner, &item.owner, sizeof(*owner)) ||
+                    llb_cid_reply_vip_in(&item.key, old, no) ||
+                    llb_cid_reply_vip_in(&item.key, next, nn);
+    if (conflict && llb_cid_reply_release(&item.key, item.keep) == 0) {
+      llb_cid_reply_purge_unowned(&item.key, 1, NULL, 0);
+      continue;
+    }
+    if (conflict)
+      ret = -EAGAIN;
+    cid_pending[remaining++] = item;
+  }
+  cid_pending_count = remaining;
+  return ret;
+}
+
+static int
+llb_cid_prepare_releases(const struct dp_nat_key *owner,
+                         const struct dp_proxy_tacts *old,
+                         const struct dp_proxy_tacts *next)
+{
+  struct dp_cid_reply_key before[LLB_MAX_NXFRMS], after[LLB_MAX_NXFRMS];
+  unsigned int no = llb_cid_reply_keys(owner, old, before);
+  unsigned int nn = llb_cid_reply_keys(owner, next, after);
+  if (!no && !nn)
+    return 0;
+  if (cid_pending_count && llb_cid_retry_releases(owner, before, no, after, nn))
+    return -EAGAIN;
+  unsigned int needed = cid_pending_count + (no > nn ? no : nn);
+  if (needed > cid_pending_capacity) {
+    unsigned int size = needed + LLB_MAX_NXFRMS;
+    if (size > LLB_CID_REPLY_GUARD_ENTRIES + 2 * LLB_MAX_NXFRMS)
+      return -ENOSPC;
+    void *p = realloc(cid_pending, size * sizeof(*cid_pending));
+    if (!p)
+      return -ENOMEM;
+    cid_pending = p;
+    cid_pending_capacity = size;
+  }
+  return 0;
+}
+
+static int
+llb_cid_reply_update(const struct dp_nat_key *key, const struct dp_proxy_tacts *old,
+                     const struct dp_proxy_tacts *next)
+{
+  struct dp_cid_reply_key old_keys[LLB_MAX_NXFRMS], next_keys[LLB_MAX_NXFRMS];
+  unsigned int old_count = llb_cid_reply_keys(key, old, old_keys);
+  unsigned int next_count = llb_cid_reply_keys(key, next, next_keys);
+  unsigned int fresh_count = 0;
+  bool was_withdrawn[LLB_MAX_NXFRMS] = {0};
+  struct dp_cid_reply_key fresh[LLB_MAX_NXFRMS];
+  unsigned int i;
+
+  for (i = 0; i < next_count; i++) {
+    if (llb_cid_reply_contains(old_keys, old_count, &next_keys[i]))
+      continue;
+    int ret = llb_cid_reply_acquire(&next_keys[i]);
+    if (ret < 0)
+      goto rollback;
+    was_withdrawn[i] = (ret == 2);
+    if (ret > 0)
+      fresh[fresh_count++] = next_keys[i];
+  }
+
+  llb_cid_reply_prune_new(fresh, fresh_count);
+  if (bpf_map_update_elem(llb_map2fd(LL_DP_NAT_MAP), key, next, BPF_ANY) != 0)
+    goto rollback;
+
+  /* Publish surviving arms before retiring flows. Keep the old reply
+   * reservations in place during the walk so late backend responses on
+   * removed NAT pairs cannot acquire an untranslated CT entry mid-update.
+   * Compare addresses and ports, since compacting arms can reuse slots.
+   */
+  struct dp_cid_reply_key removed[LLB_MAX_NXFRMS];
+  unsigned int removed_count = 0;
+  for (i = 0; i < old_count; i++) {
+    if (!llb_cid_reply_contains(next_keys, next_count, &old_keys[i]))
+      removed[removed_count++] = old_keys[i];
+  }
+  bool detach = removed_count && next_count && old->ca.cidx == next->ca.cidx;
+  if (detach) {
+    uint64_t duration = old->ito > LLB_CID_RETIRED_MIN_NS ?
+                        old->ito : LLB_CID_RETIRED_MIN_NS;
+    uint64_t until = get_os_nsecs() + duration;
+    for (i = 0; i < removed_count; i++)
+      llb_cid_retire_reply(&removed[i], until);
+    llb_cid_detach_flows(key, old->ca.cidx, removed, removed_count);
+  }
+  /* The last reference becomes a dormant reservation on partial detach.
+   * This path consumes no new capacity and the hash cannot evict it.
+   */
+  for (i = 0; i < removed_count; i++)
+    llb_cid_release_or_defer(key, &removed[i], detach);
+  llb_cid_reply_purge_unowned(removed, removed_count, next_keys, next_count);
+
+  /* The new active registration is already in effect. A returning arm
+   * uses the same key and can retire its exclusion entry now.
+   */
+  for (i = 0; i < next_count; i++) {
+    if (!llb_cid_reply_contains(old_keys, old_count, &next_keys[i]))
+      bpf_map_delete_elem(llb_map2fd(LL_DP_CID_RETIRED_MAP), &next_keys[i]);
+  }
+
+  return 0;
+
+rollback:
+  while (i > 0) {
+    i--;
+    if (!llb_cid_reply_contains(old_keys, old_count, &next_keys[i]))
+      llb_cid_release_or_defer(key, &next_keys[i], was_withdrawn[i]);
+  }
+  return -1;
+}
+
 int
 llb_add_map_elem(int tbl, void *k, void *v)
 {
   int ret = -EINVAL;
+  int have_old_nat = 0;
+  static struct dp_proxy_tacts old_nat;
   if (tbl < 0 || tbl >= LL_DP_MAX_MAP) {
     return ret; 
   }
 
   XH_LOCK();
+  unsigned int pending_before = cid_pending_count;
+
 
   /* Any table which has stats pb needs to get stats cleared before use */
   if (tbl == LL_DP_NAT_MAP ||
@@ -2406,13 +2970,22 @@ llb_add_map_elem(int tbl, void *k, void *v)
 
     if (tbl == LL_DP_NAT_MAP) {
       int aid = 0;
-      int have_old = 0;
       struct dp_proxy_tacts *nval = v;
-      static struct dp_proxy_tacts oldv;
 
-      if (!xh->have_noebpf &&
-          bpf_map_lookup_elem(llb_map2fd(tbl), k, &oldv) == 0) {
-        have_old = 1;
+      if (!xh->have_noebpf) {
+        if (bpf_map_lookup_elem(llb_map2fd(tbl), k, &old_nat) == 0) {
+          have_old_nat = 1;
+        } else if (errno != ENOENT) {
+          ret = -EFAULT;
+          goto ulock_out;
+        }
+      }
+
+      if (!xh->have_noebpf) {
+        ret = llb_cid_prepare_releases(k, have_old_nat ? &old_nat : NULL, nval);
+        pending_before = cid_pending_count;
+        if (ret)
+          goto ulock_out;
       }
 
       /* Preserve per-ep counters across in-place rule updates (e.g.
@@ -2421,8 +2994,8 @@ llb_add_map_elem(int tbl, void *k, void *v)
        * everything on fresh create
        */
       for (aid = 0; aid < LLB_MAX_NXFRMS; aid++) {
-        if (have_old &&
-            llb_nat_ep_slot_same(&oldv.nxfrms[aid], &nval->nxfrms[aid])) {
+        if (have_old_nat &&
+            llb_nat_ep_slot_same(&old_nat.nxfrms[aid], &nval->nxfrms[aid])) {
           continue;
         }
         llb_clear_map_stats(tbl, LLB_NAT_STAT_CID(cidx, aid));
@@ -2455,6 +3028,8 @@ llb_add_map_elem(int tbl, void *k, void *v)
 
   if (tbl == LL_DP_FW4_MAP || tbl == LL_DP_FW6_MAP) {
     ret = llb_add_mf_map_elem__(tbl, k, v);
+  } else if (tbl == LL_DP_NAT_MAP) {
+    ret = llb_cid_reply_update(k, have_old_nat ? &old_nat : NULL, v);
   } else {
     ret = bpf_map_update_elem(llb_map2fd(tbl), k, v, 0);
   }
@@ -2468,6 +3043,8 @@ out:
     }
   }
 ulock_out:
+  if (tbl == LL_DP_NAT_MAP && cid_pending_count > pending_before)
+    ret = -EAGAIN;
   XH_UNLOCK();
 
   return ret;
@@ -2619,6 +3196,8 @@ llb_del_map_elem_wval(int tbl, void *k, void *v)
   }
 
   XH_LOCK();
+  unsigned int pending_before = cid_pending_count;
+
 
   /* Need some pre-processing for certain maps */
   if (tbl == LL_DP_NAT_MAP) {
@@ -2645,6 +3224,12 @@ llb_del_map_elem_wval(int tbl, void *k, void *v)
       XH_UNLOCK();
       return -EINVAL;
     }
+    ret = llb_cid_prepare_releases(k, &t, NULL);
+    pending_before = cid_pending_count;
+    if (ret) {
+      XH_UNLOCK();
+      return ret;
+    }
   }
 
   if (xh->have_noebpf) {
@@ -2667,14 +3252,19 @@ llb_del_map_elem_wval(int tbl, void *k, void *v)
      * future rule reusing this cidx would start from stale values
      */
     if (ret == 0) {
-      int aid = 0;
-      for (aid = 0; aid < LLB_MAX_NXFRMS; aid++) {
+      struct dp_cid_reply_key keys[LLB_MAX_NXFRMS];
+      unsigned int count = llb_cid_reply_keys(k, &t, keys);
+      for (unsigned int i = 0; i < count; i++)
+        llb_cid_release_or_defer(k, &keys[i], false);
+      llb_cid_reply_purge_unowned(keys, count, NULL, 0);
+      for (int aid = 0; aid < LLB_MAX_NXFRMS; aid++)
         llb_clear_map_stats(tbl, LLB_NAT_STAT_CID(t.ca.cidx, aid));
-      }
+      llb_del_map_elem_nat_post_proc(k, &t);
     }
-    llb_del_map_elem_nat_post_proc(k, &t);
   }
 
+  if (tbl == LL_DP_NAT_MAP && cid_pending_count > pending_before)
+    ret = -EAGAIN;
   XH_UNLOCK();
 
   return ret;
@@ -3133,6 +3723,7 @@ ll_age_ctmap(void)
   it.uarg = as;
 
   XH_LOCK();
+  (void)llb_cid_retry_releases(NULL, NULL, 0, NULL, 0);
   if (lost > 0) {
     log_error("PerfBuf Lost count %lu", lost);
     lost = 0;
@@ -3143,6 +3734,7 @@ ll_age_ctmap(void)
     as->dir = CT_DIR_OUT;
     llb_map_loop_and_delete(LL_DP_CT_MAP, ll_ct_map_ent_has_aged, &it);
     xh->lctts = ns;
+    llb_cid_retired_age(ns);
   }
   XH_UNLOCK();
   if (adat) free(adat);

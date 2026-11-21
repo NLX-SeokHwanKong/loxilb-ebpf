@@ -24,6 +24,7 @@
 #define QUIC_SID_OFF        2
 #define QUIC_SID_LEN        4
 #define QUIC_CR_SHIFT       5
+#define QUIC_MVFST_V3_DCID_LEN 8
 
 #define QUIC_CID_INLINE static inline __attribute__((always_inline))
 
@@ -52,6 +53,16 @@ QUIC_CID_INLINE int
 quic_has_sid(const __u8 *p, const void *end)
 {
   return (const void *)(p + QUIC_SID_OFF + QUIC_SID_LEN) <= end;
+}
+
+/* mvfst V3 places the IPv4 SID at the plaintext SID offset. */
+QUIC_CID_INLINE int
+quic_is_mvfst_v3(const __u8 *p, const void *end, __u16 udp_payload_len)
+{
+  return udp_payload_len >= QUIC_DCID_OFF + QUIC_MVFST_V3_DCID_LEN &&
+         (const void *)(p + QUIC_DCID_OFF + QUIC_MVFST_V3_DCID_LEN) <= end &&
+         !quic_is_long(p[0]) && quic_fixed_bit_ok(p[0]) &&
+         (p[QUIC_DCID_OFF] & 0xc0) == 0xc0;
 }
 
 /* The server ID of a payload that passed quic_has_sid(), in network order, comparable

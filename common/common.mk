@@ -92,6 +92,13 @@ QUIC_CID ?= 1
 ifeq ($(QUIC_CID), 1)
 CFLAGS_ALL += -DHAVE_DP_QUIC_CID=1
 endif
+QUIC_CID_V3 ?= 0
+ifeq ($(QUIC_CID_V3),1)
+ifneq ($(QUIC_CID),1)
+$(error QUIC_CID_V3 requires QUIC_CID=1)
+endif
+CFLAGS_ALL += -DHAVE_DP_QUIC_CID_V3=1
+endif
 CFLAGS ?= -I$(LIBBPF_DIR)/build/usr/include/ -g
 CFLAGS += -I../headers/ -I$(LIBBPF_DIR)/ $(CFLAGS_ALL)
 LDFLAGS ?= -L$(LIBBPF_DIR)
@@ -171,8 +178,6 @@ $(XDP_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_D
 		-Werror \
 		-O2 -g -c -o ${@:.o=.o} $<
 	@#$(LLC) -march=bpf -filetype=obj -o $@ ${@:.o=.ll}
-	@sudo mkdir -p /opt/loxilb/
-	@sudo cp $@ /opt/loxilb/
 
 ## Remove debug in production
 ## -DLL_XDP_DEBUG=1
@@ -190,8 +195,6 @@ $(TC_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DE
 		-Werror \
 		-O2 -g -c -o ${@:.o=.o} $<
 	@#$(LLC) -march=bpf -mattr=dwarfris -filetype=obj -o $@ ${@:.o=.o}
-	@sudo mkdir -p /opt/loxilb/
-	@sudo cp $@ /opt/loxilb/
 	@#sudo pahole -J /opt/loxilb/$@
 
 $(TC_EOBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS)
@@ -208,8 +211,6 @@ $(TC_EOBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_D
 		-Werror \
 		-O2 -g -c -o ${@:.o=.o} $<
 	@#$(LLC) -march=bpf -mattr=dwarfris -filetype=obj -o $@ ${@:.o=.o}
-	@sudo mkdir -p /opt/loxilb/
-	@sudo cp $@ /opt/loxilb/
 	@#sudo pahole -J /opt/loxilb/$@
 
 vmlinux.h:
@@ -229,7 +230,6 @@ $(MON_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_D
 		$(CLANG_BPF_SYS_INCLUDES) \
 		-O2 -g -c -o ${@:.o=.o} $<
 	@#$(LLC) -march=bpf -mattr=dwarfris -filetype=obj -o $@ ${@:.o=.o}
-	@sudo cp $@ /opt/loxilb/
 	@#sudo pahole -J /opt/loxilb/$@
 
 $(SOCK_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) 
@@ -242,7 +242,6 @@ $(SOCK_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 		$(CLANG_BPF_SYS_INCLUDES) \
 		-O2 -g -c -o ${@:.o=.o} $<
 	@#$(LLC) -march=bpf -mattr=dwarfris -filetype=obj -o $@ ${@:.o=.o}
-	@sudo cp $@ /opt/loxilb/
 	@#sudo pahole -J /opt/loxilb/$@
 
 $(SM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) vmlinux
@@ -253,7 +252,6 @@ $(SM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) vmlinux
 		$(BPF_CFLAGS) \
 		$(CLANG_BPF_SYS_INCLUDES) \
 		-O2 -g -c -o ${@:.o=.o} $<
-	@sudo cp $@ /opt/loxilb/
 
 $(STREAM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 	$(CLANG) \
@@ -263,7 +261,6 @@ $(STREAM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 		$(BPF_CFLAGS) \
 		$(CLANG_BPF_SYS_INCLUDES) \
 		-O2 -g -c -o ${@:.o=.o} $<
-	@sudo cp $@ /opt/loxilb/
 
 $(SOCKDIR_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 	$(CLANG) \
@@ -273,7 +270,6 @@ $(SOCKDIR_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 		$(BPF_CFLAGS) \
 		$(CLANG_BPF_SYS_INCLUDES) \
 		-O2 -g -c -o ${@:.o=.o} $<
-	@sudo cp $@ /opt/loxilb/
 
 # Generate BPF skeletons
 %.skel.h: $(MON_OBJ)
@@ -281,5 +277,3 @@ $(SOCKDIR_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 	$(BPFTOOL) gen skeleton $< > $@
 
 install:
-	@sudo cp -f /opt/loxilb/llb_*.o ${dpinstalldir}/
-	@sudo cp -fr ../libbpf/src/build/* ${dpinstalldir}/
