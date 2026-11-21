@@ -401,6 +401,39 @@ dp_insert_fcv4(void *ctx, struct xfi *xf, struct dp_fc_tacts *acts)
     return -1;
   }
 
+  /* A standby may see a frame addressed to its former peer. Its synced
+   * CT can supply DNAT before the local route and L2 rewrite are known.
+   * Never teach that partial action list to a routed TCP FullNAT flow. */
+  const struct dp_fc_tact *dnat = &acts->fcta[DP_SET_DNAT];
+  if (key->l4proto == IPPROTO_TCP && dnat->ca.act_type == DP_SET_DNAT &&
+      !dnat->nat_act.dsr && !dnat->nat_act.nv6 &&
+      dnat->nat_act.xip[0] && dnat->nat_act.rip[0] &&
+      (!(xf->pm.phit & LLB_DP_RT_HIT) ||
+       acts->fcta[DP_SET_NEIGH_L2].ca.act_type != DP_SET_NEIGH_L2)) {
+    struct dp_nat_key service = {};
+    if (!(xf->pm.dp_mark & LLB_MARK_NAT)) {
+      service.daddr[0] = key->daddr;
+      service.dport = key->dport;
+      service.l4proto = IPPROTO_TCP;
+      service.zone = xf->pm.zone;
+      if (!(xf->pm.dp_mark & LLB_MARK_SNAT_EGR))
+        service.mark = xf->pm.dp_mark;
+    } else {
+      service.mark = xf->pm.dp_mark;
+    }
+    struct dp_proxy_tacts *rule = bpf_map_lookup_elem(&nat_map, &service);
+    /* Port-range rules use a mark-only key. An imported CT already
+     * carries the local rule ID even when the packet has no FW mark. */
+    if (!rule || rule->ca.cidx != dnat->nat_act.rid) {
+      __builtin_memset(&service, 0, sizeof(service));
+      service.mark = (dnat->nat_act.rid << 16) | LLB_MARK_NAT;
+      rule = bpf_map_lookup_elem(&nat_map, &service);
+    }
+    if (rule && rule->ca.cidx == dnat->nat_act.rid &&
+        (rule->opflags & NAT_LB_OP_TCP_FULLNAT_FC))
+      return 0;
+  }
+
   if (bpf_map_lookup_elem(&fc_v4_map, key) != NULL) {
     return 1;
   }
