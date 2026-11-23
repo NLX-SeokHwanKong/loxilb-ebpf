@@ -289,6 +289,7 @@ struct dp_nat_act {
   __u8 cdis;
   __u8 nmh;
   __u8 ppv2;
+  __u16 peer_port; /* FullNAT opposite-side port, network order; zero preserves it */
 };
 
 #define MIN_DP_POLICER_RATE  (8*1000*1000)  /* 1 MBps = 8 Mbps */

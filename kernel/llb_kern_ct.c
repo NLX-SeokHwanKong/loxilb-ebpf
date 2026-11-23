@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
  */
 
+#include <linux/errno.h>
+
 #ifdef HAVE_LEGACY_BPF_MAPS
 
 struct bpf_map_def SEC("maps") ct_ctr = {
@@ -1771,6 +1773,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
   nxfrm_inf_t *xxi;
   ct_dir_t cdir = CT_DIR_IN;
   int smr = CT_SMR_ERR;
+  int remap = 0;
   int k;
 
   k = 0;
@@ -1828,6 +1831,13 @@ dp_ct_in(void *ctx, struct xfi *xf)
   }
 
   dp_ct_proto_xfk_init(&key, xi, &xkey, xxi);
+
+  if (xf->nm.peer_port) {
+    if (xi->nat_flags & LLB_NAT_DST)
+      xkey.dport = xf->nm.peer_port;
+    else if (xi->nat_flags & LLB_NAT_SRC)
+      xkey.sport = xf->nm.peer_port;
+  }
 
   atdat = bpf_map_lookup_elem(&ct_map, &key);
   if (atdat == NULL) {
@@ -1952,8 +1962,30 @@ dp_ct_in(void *ctx, struct xfi *xf)
       }
     }
 
-    axtdat = bpf_map_lookup_elem(&ct_map, &xkey);
-    if (axtdat != NULL) {
+    /* Scratch actions survive between packets on the same CPU. */
+    adat->nat_act.peer_port = 0;
+    axdat->nat_act.peer_port = 0;
+    long reserved = bpf_map_update_elem(&ct_map, &xkey, axdat, BPF_NOEXIST);
+#ifdef HAVE_DP_QUIC_CID_V3
+    remap = xf->nm.quic_port_alloc && key.l4proto == IPPROTO_UDP &&
+            !key.v6 && !xi->nv6 && !xi->dsr && !xf->l2m.ssnid &&
+            key.sport && xi->nat_flags == LLB_NAT_DST &&
+            xi->nat_rip4 && xi->nat_xip4;
+    if (reserved == -EEXIST && remap) {
+      /* Claim the reverse tuple before exposing the new forward action.
+       * Keep older paths and independent clients on their own return tuple. */
+      __u32 seed = bpf_get_prandom_u32();
+      axdat->nat_act.peer_port = key.sport;
+      for (int i = 0; i < 8; i++) {
+        xkey.dport = bpf_htons(49152 + ((seed + i) & 16383));
+        reserved = bpf_map_update_elem(&ct_map, &xkey, axdat, BPF_NOEXIST);
+        if (reserved != -EEXIST)
+          break;
+      }
+      adat->nat_act.peer_port = xkey.dport;
+    }
+#endif
+    if (reserved == -EEXIST) {
       dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, LLB_CT_FAIL_XKEY_EXIST);
       LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
       return 0;
@@ -1966,16 +1998,24 @@ dp_ct_in(void *ctx, struct xfi *xf)
      * removes it. The packet itself is handed to the host stack as before
      * (CT_SMR_ERR -> DP_PASS), only the reason is now recorded.
      */
-    if (bpf_map_update_elem(&ct_map, &xkey, axdat, BPF_ANY) != 0) {
+    if (reserved != 0) {
       dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, LLB_CT_FAIL_MAP_FULL);
       goto ct_insert_fail;
     }
-    if (bpf_map_update_elem(&ct_map, &key, adat, BPF_ANY) != 0) {
+    long inserted = bpf_map_update_elem(&ct_map, &key, adat,
+                                        remap ? BPF_NOEXIST : BPF_ANY);
+    if (inserted != 0) {
       bpf_map_delete_elem(&ct_map, &xkey);
+      if (inserted == -EEXIST) {
+        /* Another CPU published the same forward tuple. Retry on next packet. */
+        LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
+        return 0;
+      }
       dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, LLB_CT_FAIL_HALF_INS);
       goto ct_insert_fail;
     }
 
+    xf->nm.peer_port = adat->nat_act.peer_port;
     atdat = bpf_map_lookup_elem(&ct_map, &key);
     axtdat = bpf_map_lookup_elem(&ct_map, &xkey);
   } else {
@@ -2040,6 +2080,11 @@ dp_ct_in(void *ctx, struct xfi *xf)
   return smr; 
 
 ct_insert_fail:
+  if (remap) {
+    /* A CID VIP cannot deliver a packet without its return mapping. */
+    LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
+    return 0;
+  }
   LLBS_PPLN_PASSC(xf, LLB_PIPE_RC_CT_FULL);
   if (xi->nat_flags) {
     /* the endpoint's session count was raised when it was selected */

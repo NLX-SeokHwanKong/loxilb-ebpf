@@ -3475,6 +3475,14 @@ ctm_proto_xfk_init(struct dp_ct_key *key,
 
   xi = &adat->ctd.xi;
 
+  if (key->l4proto == IPPROTO_UDP && !key->v6 && !adat->ctd.pi.frag &&
+      adat->nat_act.peer_port) {
+    if (xi->nat_flags & LLB_NAT_DST)
+      xkey->dport = adat->nat_act.peer_port;
+    else if (xi->nat_flags & LLB_NAT_SRC)
+      xkey->sport = adat->nat_act.peer_port;
+  }
+
   if (xi->dsr || adat->ctd.pi.frag) {
     return 0;
   }
