@@ -2107,6 +2107,8 @@ dp_do_dnat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
     } else {
       if (xf->nm.nrip4) {
         dp_set_udp_src_ip(ctx, xf, xf->nm.nrip4);
+        if (xf->nm.peer_port)
+          dp_set_udp_sport(ctx, xf, xf->nm.peer_port);
       }
       dp_set_udp_dst_ip(ctx, xf, xip);
     }
@@ -2270,6 +2272,8 @@ dp_do_snat(void *ctx, struct xfi *xf, __be32 xip, __be16 xport)
       dp_set_udp_src_ip(ctx, xf, xip);
       if (xf->nm.nrip4) {
         dp_set_udp_dst_ip(ctx, xf, xf->nm.nrip4);
+        if (xf->nm.peer_port)
+          dp_set_udp_dport(ctx, xf, xf->nm.peer_port);
       }
     }
     dp_set_udp_sport(ctx, xf, xport);

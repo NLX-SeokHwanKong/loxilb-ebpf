@@ -320,6 +320,8 @@ struct dp_nat_mdi {
     __u8            ppv2:4;
     __u8            cdis:4;
     __u8            rnat:4;        /* Reply direction of a DNAT (LB) flow */
+    __u16           peer_port;
+    __u8            quic_port_alloc;
     __u64           ito;
 };
 

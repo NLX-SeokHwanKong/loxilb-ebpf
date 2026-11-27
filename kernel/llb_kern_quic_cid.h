@@ -113,7 +113,10 @@ dp_sel_quic_cid(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
       /* Compare the decoded scalar in the loop to bound verifier work. */
       for (i = 0; i < LLB_MAX_NXFRMS && i < act->nxfrm; i++) {
         nxfrm_act = &act->nxfrms[i];
-        if (nxfrm_act->inactive == 0 && nxfrm_act->nat_xip4 == sid) {
+        if (nxfrm_act->nat_xip4 == sid &&
+            (nxfrm_act->inactive == 0 ||
+             (act->quic_profile == LLB_QUIC_PROFILE_MVFST_V3 &&
+              nxfrm_act->inactive == LLB_NAT_EP_DRAINING))) {
           sel = i;
           break;
         }
@@ -136,8 +139,13 @@ dp_sel_quic_cid(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
     return sel;
   }
 
-  if (parsed && act->quic_profile == LLB_QUIC_PROFILE_LEGACY &&
-      (act->opflags & NAT_LB_OP_CID_REPLY_GUARD))
+  if (parsed &&
+      (act->quic_profile == LLB_QUIC_PROFILE_MVFST_V3 ||
+       (act->quic_profile == LLB_QUIC_PROFILE_LEGACY &&
+        (act->opflags & NAT_LB_OP_CID_REPLY_GUARD))))
+    return QUIC_CID_NO_ACTIVE_SID;
+
+  if (!act->nxfrm)
     return QUIC_CID_NO_ACTIVE_SID;
 
   /* A private copy of the NAT_LB_SEL_HASH branch, which stays untouched */
@@ -151,6 +159,9 @@ dp_sel_quic_cid(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
           break;
         }
       }
+      if (act->quic_profile == LLB_QUIC_PROFILE_MVFST_V3 &&
+          act->nxfrms[sel].inactive)
+        return QUIC_CID_NO_ACTIVE_SID;
     }
   }
   return sel;

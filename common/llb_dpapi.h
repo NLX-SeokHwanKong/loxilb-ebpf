@@ -289,6 +289,7 @@ struct dp_nat_act {
   __u8 cdis;
   __u8 nmh;
   __u8 ppv2;
+  __u16 peer_port; /* FullNAT opposite-side port, network order; zero preserves it */
 };
 
 #define MIN_DP_POLICER_RATE  (8*1000*1000)  /* 1 MBps = 8 Mbps */
@@ -699,10 +700,12 @@ typedef struct {
 #define nat_xip4 nat_xip[0]
 #define nat_rip4 nat_rip[0]
 
+#define LLB_NAT_EP_DRAINING 2
+
 struct mf_xfrm_inf {
   /* LLB_NAT_XXX flags */
   uint8_t nat_flags;
-  uint8_t inactive;
+  uint8_t inactive; /* 0 active, 1 hard unavailable, 2 draining */
   uint8_t wprio;
   uint8_t nv6;
   uint8_t dsr;
