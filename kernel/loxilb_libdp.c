@@ -2694,8 +2694,8 @@ llb_cid_detach_flows(const struct dp_nat_key *service, uint32_t rid,
 }
 
 /* The coordinator exclusively owns and fences both data ports before entry.
- * Get the successor before deleting the current key. A failed read/delete
- * or incomplete traversal must never be reported as a drained service. */
+ * Get the successor before reading or deleting the current key. Keys may
+ * disappear concurrently. Unexpected errors and incomplete walks still fail. */
 static int
 llb_cid_handoff_walk(const struct llb_cid_detach *scope, int table,
                      bool verify, unsigned int *removed)
@@ -2710,22 +2710,27 @@ llb_cid_handoff_walk(const struct llb_cid_detach *scope, int table,
   for (uint32_t n = 0; more == 0; n++) {
     if (n >= map->max_entries)
       return -EAGAIN;
-    if (bpf_map_lookup_elem(fd, &key, &value) != 0)
-      return -errno;
     more = bpf_map_get_next_key(fd, &key, &next);
     if (more && errno != ENOENT)
       return -errno;
-    bool owned = table == LL_DP_CT_MAP
-                 ? llb_cid_ct_owned(scope, &key.ct, &value.ct)
-                 : llb_cid_fc_owned(scope, &key.fc, &value.fc);
-    if (owned) {
-      if (verify)
-        return -EBUSY;
-      if (bpf_map_delete_elem(fd, &key) != 0)
+    if (bpf_map_lookup_elem(fd, &key, &value) != 0) {
+      if (errno != ENOENT)
         return -errno;
-      if (table == LL_DP_CT_MAP)
-        llb_clear_map_stats(LL_DP_CT_STATS_MAP, value.ct.ca.cidx);
-      (*removed)++;
+    } else {
+      bool owned = table == LL_DP_CT_MAP
+                   ? llb_cid_ct_owned(scope, &key.ct, &value.ct)
+                   : llb_cid_fc_owned(scope, &key.fc, &value.fc);
+      if (owned) {
+        if (verify)
+          return -EBUSY;
+        if (bpf_map_delete_elem(fd, &key) == 0) {
+          if (table == LL_DP_CT_MAP)
+            llb_clear_map_stats(LL_DP_CT_STATS_MAP, value.ct.ca.cidx);
+          (*removed)++;
+        } else if (errno != ENOENT) {
+          return -errno;
+        }
+      }
     }
     if (more)
       return 0;
