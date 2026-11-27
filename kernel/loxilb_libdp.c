@@ -2039,7 +2039,7 @@ llb_add_map_elem_nat_post_proc(void *k, void *v)
   for (i = 0; i < na->nxfrm && i < LLB_MAX_NXFRMS; i++) {
     ep_arm = &na->nxfrms[i];
 
-    if (ep_arm->inactive) {
+    if (ep_arm->inactive && ep_arm->inactive != LLB_NAT_EP_DRAINING) {
       inact_aids[j++] = i;
     }
   }
@@ -2066,7 +2066,7 @@ llb_del_map_elem_nat_post_proc(void *k, void *v)
   for (i = 0; i < na->nxfrm && i < LLB_MAX_NXFRMS; i++) {
     ep_arm = &na->nxfrms[i];
 
-    if (ep_arm->inactive == 0) {
+    if (ep_arm->inactive == 0 || ep_arm->inactive == LLB_NAT_EP_DRAINING) {
       inact_aids[j++] = i;
     }
   }
