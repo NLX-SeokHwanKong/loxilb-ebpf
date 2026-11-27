@@ -68,5 +68,11 @@ struct ebpfcfg {
 void loxilb_set_loglevel(struct ebpfcfg *cfg);
 int loxilb_main(struct ebpfcfg *cfg);
 
+/* Caller holds the service's exclusive bidirectional fabric fence.
+ * vip and port are in network byte order, zone and local rid in host order.
+ * On error the counts include any entries already removed. */
+int llb_cid_handoff_drain(uint32_t vip, uint16_t zone, uint16_t port,
+                          uint32_t rid, unsigned int *ct, unsigned int *fc);
+
 
 #endif

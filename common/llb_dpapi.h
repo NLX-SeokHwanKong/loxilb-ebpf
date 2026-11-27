@@ -73,6 +73,24 @@
 /* Hard-timeout of 15m for fc cp entry */
 #define FC_V4_CPTO            ( 900000000000)
 
+/* Neighbor resolve requests (cp_ring) are sent at most once per holdoff
+ * for a given address. The map only needs to hold the addresses that are
+ * unresolved at the same time.
+ */
+#define RSLV_HOLDOFF_NS       (100000000ULL)
+#define LLB_RSLV_MAP_ENTRIES  (4096)
+
+/* Index into rslv_stats_map */
+#define LLB_RSLV_STAT_SENT    0
+#define LLB_RSLV_STAT_HELD    1
+#define LLB_RSLV_STAT_MAX     2
+
+struct dp_rslv_key {
+  __u32 addr[4];
+  __u8  v6;
+  __u8  pad[3];
+};
+
 /* Hard-timeout of 30m for ct entry */
 #define CT_V4_CPTO            (1800000000000)
 
@@ -155,6 +173,8 @@ enum llb_dp_tid {
   LL_DP_SOCK_RWR_MAP,
   LL_DP_SOCK_PROXY_MAP,
   LL_DP_CT_FAIL_STATS_MAP,
+  LL_DP_CID_REPLY_GUARD_MAP,
+  LL_DP_CID_RETIRED_MAP,
   LL_DP_MAX_MAP
 };
 
@@ -166,6 +186,9 @@ enum llb_ct_fail {
   LLB_CT_FAIL_HALF_INS,     /* only the reverse entry fit, rolled back */
   LLB_CT_FAIL_XKEY_EXIST,   /* reverse key present without the forward key */
   LLB_CT_FAIL_XKEY_MISS,    /* forward key present without the reverse key */
+  LLB_CT_FAIL_CID_REPLY,   /* guarded FullNAT reply without conntrack */
+  LLB_CT_FAIL_CID_RETIRED, /* late reply from an arm removed from NAT */
+  LLB_CT_FAIL_CID_WITHDRAWN, /* withdrawn arm with no live LRU hint */
   LLB_CT_FAIL_MAX
 };
 
@@ -266,6 +289,7 @@ struct dp_nat_act {
   __u8 cdis;
   __u8 nmh;
   __u8 ppv2;
+  __u16 peer_port; /* FullNAT opposite-side port, network order; zero preserves it */
 };
 
 #define MIN_DP_POLICER_RATE  (8*1000*1000)  /* 1 MBps = 8 Mbps */
@@ -676,10 +700,12 @@ typedef struct {
 #define nat_xip4 nat_xip[0]
 #define nat_rip4 nat_rip[0]
 
+#define LLB_NAT_EP_DRAINING 2
+
 struct mf_xfrm_inf {
   /* LLB_NAT_XXX flags */
   uint8_t nat_flags;
-  uint8_t inactive;
+  uint8_t inactive; /* 0 active, 1 hard unavailable, 2 draining */
   uint8_t wprio;
   uint8_t nv6;
   uint8_t dsr;
@@ -826,6 +852,9 @@ struct dp_nat_key {
 #define NAT_LB_SEL_N3 6
 #define NAT_LB_SEL_QUIC_CID 7
 
+#define LLB_QUIC_PROFILE_LEGACY   0
+#define LLB_QUIC_PROFILE_MVFST_V3 1
+
 #define NAT_LB_PERSIST_TIMEOUT (10800000000000ULL)
 
 #define SEC_MODE_NONE 0
@@ -833,6 +862,20 @@ struct dp_nat_key {
 #define SEC_MODE_HTTPS_E2E 2
 
 #define NAT_LB_OP_CHKSRC 0x1
+#define NAT_LB_OP_CID_REPLY_GUARD 0x2
+#define NAT_LB_OP_TCP_FULLNAT_FC 0x4
+
+#define LLB_CID_RETIRED_ENTRIES LLB_NATV4_MAP_ENTRIES
+#define LLB_CID_RETIRED_MIN_NS (60000000000ULL)
+/* The non-LRU reply guard stores active references. Zero reserves a withdrawn key. */
+#define LLB_CID_REPLY_GUARD_ENTRIES (LLB_NATV4_MAP_ENTRIES * LLB_MAX_NXFRMS)
+
+struct dp_cid_reply_key {
+  __u32 vip;
+  __u32 backend;
+  __u16 sport;
+  __u16 zone;
+};
 
 struct dp_proxy_tacts {
   struct dp_cmn_act ca;
@@ -849,7 +892,8 @@ struct dp_proxy_tacts {
   uint8_t ppv2;
   uint8_t quic_sid_len;     /* NAT_LB_SEL_QUIC_CID only */
   uint8_t quic_cr;          /* NAT_LB_SEL_QUIC_CID only */
-  uint8_t pad1[5];
+  uint8_t quic_profile;     /* NAT_LB_SEL_QUIC_CID only */
+  uint8_t pad1[4];
   uint64_t lts;
   uint64_t base_to;
   uint32_t pmhh[LLB_MAX_MHOSTS];

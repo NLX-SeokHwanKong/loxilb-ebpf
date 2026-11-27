@@ -92,6 +92,28 @@ test_bounds(void)
   CHECK(quic_has_sid(pkt, pkt + sizeof(pkt)));
 }
 
+static void
+test_mvfst_v3(void)
+{
+  __u8 packet[] = { 0x40, 0xc0, 192, 0, 2, 22, 0, 0, 0 };
+  unsigned int i;
+
+  for (i = 0; i < sizeof(packet); i++) {
+    CHECK(!quic_is_mvfst_v3(packet, packet + i, sizeof(packet)));
+    CHECK(!quic_is_mvfst_v3(packet, packet + sizeof(packet), i));
+  }
+  for (i = 0; i < 256; i++) {
+    packet[QUIC_DCID_OFF] = (__u8)i;
+    CHECK(quic_is_mvfst_v3(packet, packet + sizeof(packet), sizeof(packet)) ==
+          (i >= 0xc0));
+  }
+  CHECK(quic_sid_v4(packet) == inet_addr("192.0.2.22"));
+  packet[0] = 0xc0;
+  CHECK(!quic_is_mvfst_v3(packet, packet + sizeof(packet), sizeof(packet)));
+  packet[0] = 0;
+  CHECK(!quic_is_mvfst_v3(packet, packet + sizeof(packet), sizeof(packet)));
+}
+
 int
 main(void)
 {
@@ -100,6 +122,7 @@ main(void)
   test_sid();
   test_sid_unaligned();
   test_bounds();
+  test_mvfst_v3();
   if (failed) {
     printf("quic-cid-test: %d check(s) failed\n", failed);
     return EXIT_FAILURE;

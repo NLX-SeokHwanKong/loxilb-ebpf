@@ -226,6 +226,12 @@ dp_do_nat(void *ctx, struct xfi *xf)
   if (act->ca.act_type == DP_SET_SNAT || 
       act->ca.act_type == DP_SET_DNAT) {
     sel = dp_sel_nat_ep(ctx, xf, act);
+#ifdef HAVE_DP_QUIC_CID
+    if (sel == QUIC_CID_NO_ACTIVE_SID) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_UNK);
+      return -1;
+    }
+#endif
 
     xf->nm.dsr = act->ca.oaux ? 1: 0;
     xf->nm.cdis = act->cdis ? 1: 0;
@@ -248,6 +254,10 @@ dp_do_nat(void *ctx, struct xfi *xf)
       DP_XADDR_CP(xf->nm.nrip, nxfrm_act->nat_rip);
       xf->nm.nxport = nxfrm_act->nat_xport;
       xf->nm.nv6 = nxfrm_act->nv6 ? 1: 0;
+#ifdef HAVE_DP_QUIC_CID_V3
+      xf->nm.quic_port_alloc = act->sel_type == NAT_LB_SEL_QUIC_CID &&
+                               act->quic_profile == LLB_QUIC_PROFILE_MVFST_V3;
+#endif
       xf->nm.sel_aid = sel;
       xf->nm.ito = act->ito;
       xf->pm.rule_id =  act->ca.cidx;

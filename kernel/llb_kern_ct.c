@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
  */
 
+#include <linux/errno.h>
+
 #ifdef HAVE_LEGACY_BPF_MAPS
 
 struct bpf_map_def SEC("maps") ct_ctr = {
@@ -438,8 +440,14 @@ dp_ct_tcp_sm(void *ctx, struct xfi *xf,
     } 
 
     if ((tcp_flags & LLB_TCP_SYN) == LLB_TCP_SYN) {
-      td->seq = seq;
-      nstate = CT_TCP_SS;
+      /* The same SYN again means the SYN-ACK did not reach the client.
+       * Stay in SA: the server's SYN-ACK retransmit can already be through,
+       * and back in SS the client's ACK for it would be an error that
+       * deletes the entry. Only a new SYN restarts the handshake. */
+      if (seq != td->seq) {
+        td->seq = seq;
+        nstate = CT_TCP_SS;
+      }
       goto end;
     }
   
@@ -914,7 +922,12 @@ dp_ct_sctp_sm(void *ctx, struct xfi *xf,
     nstate = CT_SCTP_ERR;
     goto end;
   case SCTP_SHUT:
-    nstate = CT_SCTP_SHUT;
+    /* A SHUTDOWN retransmit that crossed the SHUTDOWN ACK must not undo it:
+     * back in SHUT, the SHUTDOWN COMPLETE that follows would be an error
+     * that deletes the entry before it reaches the endpoint. */
+    if (ss->state != CT_SCTP_SHUTA) {
+      nstate = CT_SCTP_SHUT;
+    }
     goto end;
   case SCTP_ABORT:
     nstate = CT_SCTP_ABRT;
@@ -1684,6 +1697,69 @@ dp_ct_ctd(struct xfi *xf,
   return 0;
 }
 
+#ifdef HAVE_DP_QUIC_CID
+/* A reservation configured before VIP publication identifies the backend
+ * side of an IPv4 UDP FullNAT CID rule. A reply can arrive before the first
+ * client packet reaches a replacement LB. Without this check, it creates
+ * an un-NATed pair and occupies the reverse key required by FullNAT.
+ *
+ * Only a conntrack miss can hit the reservation. An existing NAT reply
+ * follows the ordinary return path, and a packet that matched a frontend
+ * NAT rule is still processed as a new forward flow.
+ */
+#ifdef HAVE_LEGACY_BPF_MAPS
+struct bpf_map_def SEC("maps") cid_reply_guard = {
+  .type = BPF_MAP_TYPE_HASH,
+  .key_size = sizeof(struct dp_cid_reply_key),
+  .value_size = sizeof(__u32),
+  .max_entries = LLB_CID_REPLY_GUARD_ENTRIES
+};
+#else
+struct cid_reply_guard_d {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, struct dp_cid_reply_key);
+  __type(value, __u32);
+  __uint(max_entries, LLB_CID_REPLY_GUARD_ENTRIES);
+} cid_reply_guard SEC(".maps");
+#endif
+
+#ifdef HAVE_LEGACY_BPF_MAPS
+struct bpf_map_def SEC("maps") cid_retired = {
+  .type = BPF_MAP_TYPE_LRU_HASH,
+  .key_size = sizeof(struct dp_cid_reply_key),
+  .value_size = sizeof(__u64),
+  .max_entries = LLB_CID_RETIRED_ENTRIES
+};
+#else
+struct cid_retired_d {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct dp_cid_reply_key);
+  __type(value, __u64);
+  __uint(max_entries, LLB_CID_RETIRED_ENTRIES);
+} cid_retired SEC(".maps");
+#endif
+
+static int __always_inline
+dp_ct_cid_orphan(const struct dp_ct_key *key)
+{
+  struct dp_cid_reply_key reply = {
+    .vip = key->daddr[0],
+    .backend = key->saddr[0],
+    .sport = key->sport,
+    .zone = key->zone
+  };
+  const __u32 *refs = bpf_map_lookup_elem(&cid_reply_guard, &reply);
+  if (refs && *refs)
+    return LLB_CT_FAIL_CID_REPLY;
+
+  int withdrawn = refs != NULL;
+  const __u64 *until = bpf_map_lookup_elem(&cid_retired, &reply);
+  if (until && *until > bpf_ktime_get_ns())
+    return LLB_CT_FAIL_CID_RETIRED;
+  return withdrawn ? LLB_CT_FAIL_CID_WITHDRAWN : -1;
+}
+#endif
+
 static int __always_inline
 dp_ct_in(void *ctx, struct xfi *xf)
 {
@@ -1697,6 +1773,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
   nxfrm_inf_t *xxi;
   ct_dir_t cdir = CT_DIR_IN;
   int smr = CT_SMR_ERR;
+  int remap = 0;
   int k;
 
   k = 0;
@@ -1755,9 +1832,26 @@ dp_ct_in(void *ctx, struct xfi *xf)
 
   dp_ct_proto_xfk_init(&key, xi, &xkey, xxi);
 
+  if (xf->nm.peer_port) {
+    if (xi->nat_flags & LLB_NAT_DST)
+      xkey.dport = xf->nm.peer_port;
+    else if (xi->nat_flags & LLB_NAT_SRC)
+      xkey.sport = xf->nm.peer_port;
+  }
+
   atdat = bpf_map_lookup_elem(&ct_map, &key);
   if (atdat == NULL) {
-
+#ifdef HAVE_DP_QUIC_CID
+    if (key.l4proto == IPPROTO_UDP && !key.v6 &&
+        !key.ident && !key.type && !xf->l2m.ssnid && !xi->nat_flags) {
+      int reason = dp_ct_cid_orphan(&key);
+      if (reason >= 0) {
+        dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, reason);
+        LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
+        return 0;
+      }
+    }
+#endif
     if (xf->nm.dsr && key.l4proto == IPPROTO_TCP &&
         !(xf->pm.tcp_flags & LLB_TCP_SYN)) {
       /* DSR releases the entry at the client's FIN. A later empty segment
@@ -1868,8 +1962,30 @@ dp_ct_in(void *ctx, struct xfi *xf)
       }
     }
 
-    axtdat = bpf_map_lookup_elem(&ct_map, &xkey);
-    if (axtdat != NULL) {
+    /* Scratch actions survive between packets on the same CPU. */
+    adat->nat_act.peer_port = 0;
+    axdat->nat_act.peer_port = 0;
+    long reserved = bpf_map_update_elem(&ct_map, &xkey, axdat, BPF_NOEXIST);
+#ifdef HAVE_DP_QUIC_CID_V3
+    remap = xf->nm.quic_port_alloc && key.l4proto == IPPROTO_UDP &&
+            !key.v6 && !xi->nv6 && !xi->dsr && !xf->l2m.ssnid &&
+            key.sport && xi->nat_flags == LLB_NAT_DST &&
+            xi->nat_rip4 && xi->nat_xip4;
+    if (reserved == -EEXIST && remap) {
+      /* Claim the reverse tuple before exposing the new forward action.
+       * Keep older paths and independent clients on their own return tuple. */
+      __u32 seed = bpf_get_prandom_u32();
+      axdat->nat_act.peer_port = key.sport;
+      for (int i = 0; i < 8; i++) {
+        xkey.dport = bpf_htons(49152 + ((seed + i) & 16383));
+        reserved = bpf_map_update_elem(&ct_map, &xkey, axdat, BPF_NOEXIST);
+        if (reserved != -EEXIST)
+          break;
+      }
+      adat->nat_act.peer_port = xkey.dport;
+    }
+#endif
+    if (reserved == -EEXIST) {
       dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, LLB_CT_FAIL_XKEY_EXIST);
       LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
       return 0;
@@ -1882,16 +1998,24 @@ dp_ct_in(void *ctx, struct xfi *xf)
      * removes it. The packet itself is handed to the host stack as before
      * (CT_SMR_ERR -> DP_PASS), only the reason is now recorded.
      */
-    if (bpf_map_update_elem(&ct_map, &xkey, axdat, BPF_ANY) != 0) {
+    if (reserved != 0) {
       dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, LLB_CT_FAIL_MAP_FULL);
       goto ct_insert_fail;
     }
-    if (bpf_map_update_elem(&ct_map, &key, adat, BPF_ANY) != 0) {
+    long inserted = bpf_map_update_elem(&ct_map, &key, adat,
+                                        remap ? BPF_NOEXIST : BPF_ANY);
+    if (inserted != 0) {
       bpf_map_delete_elem(&ct_map, &xkey);
+      if (inserted == -EEXIST) {
+        /* Another CPU published the same forward tuple. Retry on next packet. */
+        LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
+        return 0;
+      }
       dp_do_map_stats(ctx, xf, LL_DP_CT_FAIL_STATS_MAP, LLB_CT_FAIL_HALF_INS);
       goto ct_insert_fail;
     }
 
+    xf->nm.peer_port = adat->nat_act.peer_port;
     atdat = bpf_map_lookup_elem(&ct_map, &key);
     axtdat = bpf_map_lookup_elem(&ct_map, &xkey);
   } else {
@@ -1956,6 +2080,11 @@ dp_ct_in(void *ctx, struct xfi *xf)
   return smr; 
 
 ct_insert_fail:
+  if (remap) {
+    /* A CID VIP cannot deliver a packet without its return mapping. */
+    LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
+    return 0;
+  }
   LLBS_PPLN_PASSC(xf, LLB_PIPE_RC_CT_FULL);
   if (xi->nat_flags) {
     /* the endpoint's session count was raised when it was selected */
