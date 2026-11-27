@@ -2431,6 +2431,40 @@ llb_cid_reply_keys(const struct dp_nat_key *key, const struct dp_proxy_tacts *na
 #define CID_REPLY_WITHDRAWN (1U << 31)
 #define CID_REPLY_REFS      (CID_REPLY_WITHDRAWN - 1U)
 
+/* Called under XH_LOCK only after a new reservation hits map capacity. */
+static uint32_t
+llb_cid_reply_reclaim(int guard_fd)
+{
+  int retired_fd = llb_map2fd(LL_DP_CID_RETIRED_MAP);
+  uint32_t limit = xh->maps[LL_DP_CID_REPLY_GUARD_MAP].max_entries;
+  uint64_t now = get_os_nsecs();
+  struct dp_cid_reply_key next, key;
+  uint32_t scanned = 0, deleted = 0;
+  int rc = bpf_map_get_next_key(guard_fd, NULL, &next);
+
+  while (rc == 0 && scanned < limit) {
+    uint64_t until;
+    __u32 refs;
+
+    key = next;
+    /* Look ahead while the current key still exists. */
+    rc = bpf_map_get_next_key(guard_fd, &key, &next);
+    scanned++;
+    if (bpf_map_lookup_elem(guard_fd, &key, &refs) != 0 || refs != 0)
+      continue;
+
+    int retired = bpf_map_lookup_elem(retired_fd, &key, &until);
+    if (retired == 0 ? until > now : errno != ENOENT)
+      continue;
+
+    if (bpf_map_delete_elem(guard_fd, &key) == 0)
+      deleted++;
+  }
+
+  log_info("CID reply guard reclaim: scanned=%u deleted=%u", scanned, deleted);
+  return scanned;
+}
+
 static int
 llb_cid_reply_acquire(const struct dp_cid_reply_key *key)
 {
@@ -2454,8 +2488,19 @@ llb_cid_reply_acquire(const struct dp_cid_reply_key *key)
     return -1;
 
   refs = 1;
-  if (bpf_map_update_elem(fd, key, &refs, BPF_NOEXIST) != 0)
-    return -1;
+  if (bpf_map_update_elem(fd, key, &refs, BPF_NOEXIST) != 0) {
+    if (errno != E2BIG)
+      return -1;
+    uint32_t scanned = llb_cid_reply_reclaim(fd);
+    if (bpf_map_update_elem(fd, key, &refs, BPF_NOEXIST) != 0) {
+      int error = errno;
+      log_warn("CID reply guard %s: rule update deferred (scanned=%u, errno=%d)",
+               error == E2BIG ? "full after reclaim" : "insert failed after reclaim",
+               scanned, error);
+      errno = error;
+      return -1;
+    }
+  }
   return 1;
 }
 
