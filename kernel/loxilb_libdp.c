@@ -2431,6 +2431,40 @@ llb_cid_reply_keys(const struct dp_nat_key *key, const struct dp_proxy_tacts *na
 #define CID_REPLY_WITHDRAWN (1U << 31)
 #define CID_REPLY_REFS      (CID_REPLY_WITHDRAWN - 1U)
 
+/* Called under XH_LOCK only after a new reservation hits map capacity. */
+static uint32_t
+llb_cid_reply_reclaim(int guard_fd)
+{
+  int retired_fd = llb_map2fd(LL_DP_CID_RETIRED_MAP);
+  uint32_t limit = xh->maps[LL_DP_CID_REPLY_GUARD_MAP].max_entries;
+  uint64_t now = get_os_nsecs();
+  struct dp_cid_reply_key next, key;
+  uint32_t scanned = 0, deleted = 0;
+  int rc = bpf_map_get_next_key(guard_fd, NULL, &next);
+
+  while (rc == 0 && scanned < limit) {
+    uint64_t until;
+    __u32 refs;
+
+    key = next;
+    /* Look ahead while the current key still exists. */
+    rc = bpf_map_get_next_key(guard_fd, &key, &next);
+    scanned++;
+    if (bpf_map_lookup_elem(guard_fd, &key, &refs) != 0 || refs != 0)
+      continue;
+
+    int retired = bpf_map_lookup_elem(retired_fd, &key, &until);
+    if (retired == 0 ? until > now : errno != ENOENT)
+      continue;
+
+    if (bpf_map_delete_elem(guard_fd, &key) == 0)
+      deleted++;
+  }
+
+  log_info("CID reply guard reclaim: scanned=%u deleted=%u", scanned, deleted);
+  return scanned;
+}
+
 static int
 llb_cid_reply_acquire(const struct dp_cid_reply_key *key)
 {
@@ -2454,8 +2488,19 @@ llb_cid_reply_acquire(const struct dp_cid_reply_key *key)
     return -1;
 
   refs = 1;
-  if (bpf_map_update_elem(fd, key, &refs, BPF_NOEXIST) != 0)
-    return -1;
+  if (bpf_map_update_elem(fd, key, &refs, BPF_NOEXIST) != 0) {
+    if (errno != E2BIG)
+      return -1;
+    uint32_t scanned = llb_cid_reply_reclaim(fd);
+    if (bpf_map_update_elem(fd, key, &refs, BPF_NOEXIST) != 0) {
+      int error = errno;
+      log_warn("CID reply guard %s: rule update deferred (scanned=%u, errno=%d)",
+               error == E2BIG ? "full after reclaim" : "insert failed after reclaim",
+               scanned, error);
+      errno = error;
+      return -1;
+    }
+  }
   return 1;
 }
 
@@ -2694,8 +2739,8 @@ llb_cid_detach_flows(const struct dp_nat_key *service, uint32_t rid,
 }
 
 /* The coordinator exclusively owns and fences both data ports before entry.
- * Get the successor before deleting the current key. A failed read/delete
- * or incomplete traversal must never be reported as a drained service. */
+ * Get the successor before reading or deleting the current key. Keys may
+ * disappear concurrently. Unexpected errors and incomplete walks still fail. */
 static int
 llb_cid_handoff_walk(const struct llb_cid_detach *scope, int table,
                      bool verify, unsigned int *removed)
@@ -2710,22 +2755,27 @@ llb_cid_handoff_walk(const struct llb_cid_detach *scope, int table,
   for (uint32_t n = 0; more == 0; n++) {
     if (n >= map->max_entries)
       return -EAGAIN;
-    if (bpf_map_lookup_elem(fd, &key, &value) != 0)
-      return -errno;
     more = bpf_map_get_next_key(fd, &key, &next);
     if (more && errno != ENOENT)
       return -errno;
-    bool owned = table == LL_DP_CT_MAP
-                 ? llb_cid_ct_owned(scope, &key.ct, &value.ct)
-                 : llb_cid_fc_owned(scope, &key.fc, &value.fc);
-    if (owned) {
-      if (verify)
-        return -EBUSY;
-      if (bpf_map_delete_elem(fd, &key) != 0)
+    if (bpf_map_lookup_elem(fd, &key, &value) != 0) {
+      if (errno != ENOENT)
         return -errno;
-      if (table == LL_DP_CT_MAP)
-        llb_clear_map_stats(LL_DP_CT_STATS_MAP, value.ct.ca.cidx);
-      (*removed)++;
+    } else {
+      bool owned = table == LL_DP_CT_MAP
+                   ? llb_cid_ct_owned(scope, &key.ct, &value.ct)
+                   : llb_cid_fc_owned(scope, &key.fc, &value.fc);
+      if (owned) {
+        if (verify)
+          return -EBUSY;
+        if (bpf_map_delete_elem(fd, &key) == 0) {
+          if (table == LL_DP_CT_MAP)
+            llb_clear_map_stats(LL_DP_CT_STATS_MAP, value.ct.ca.cidx);
+          (*removed)++;
+        } else if (errno != ENOENT) {
+          return -errno;
+        }
+      }
     }
     if (more)
       return 0;
